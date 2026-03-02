@@ -237,6 +237,11 @@ def main():
 )
 @click.option("--verify-integrity", is_flag=True, help="Verify package integrity (SHA256/SRI) and SLSA provenance against registries")
 @click.option(
+    "--verify-instructions",
+    is_flag=True,
+    help="Verify instruction file provenance (CLAUDE.md, .cursorrules, SKILL.md) via Sigstore bundles",
+)
+@click.option(
     "--ai-enrich",
     is_flag=True,
     help="Enrich findings with LLM-generated risk narratives, executive summary, and threat chains. Auto-detects Ollama (free, local) or uses litellm (pip install 'agent-bom[ai-enrich]')",
@@ -288,6 +293,7 @@ def main():
 @click.option("--gcp-project", default=None, metavar="PROJECT", envvar="GOOGLE_CLOUD_PROJECT", help="GCP project ID")
 @click.option("--databricks", "databricks_flag", is_flag=True, help="Discover agents from Databricks clusters and model serving")
 @click.option("--snowflake", "snowflake_flag", is_flag=True, help="Discover Cortex agents and Snowpark apps from Snowflake")
+@click.option("--cortex-observability", is_flag=True, help="Include Cortex agent observability telemetry (requires --snowflake)")
 @click.option("--nebius", "nebius_flag", is_flag=True, help="Discover AI workloads from Nebius GPU cloud")
 @click.option("--nebius-api-key", default=None, envvar="NEBIUS_API_KEY", metavar="KEY", help="Nebius API key")
 @click.option("--nebius-project-id", default=None, envvar="NEBIUS_PROJECT_ID", metavar="ID", help="Nebius project ID")
@@ -361,7 +367,7 @@ def main():
     "--preset",
     type=click.Choice(["ci", "enterprise", "quick"]),
     default=None,
-    help="Scan preset: ci (quiet, json, fail-on-critical), enterprise (enrich, introspect, transitive, verify-integrity), quick (no transitive, no enrich)",
+    help="Scan preset: ci (quiet, json, fail-on-critical), enterprise (enrich, introspect, transitive, verify-integrity, verify-instructions), quick (no transitive, no enrich)",
 )
 @click.option(
     "--compliance-export",
@@ -416,6 +422,7 @@ def scan(
     introspect_timeout: float,
     enforce: bool,
     verify_integrity: bool,
+    verify_instructions: bool,
     ai_enrich: bool,
     ai_model: str,
     aws: bool,
@@ -427,6 +434,7 @@ def scan(
     gcp_project: Optional[str],
     databricks_flag: bool,
     snowflake_flag: bool,
+    cortex_observability: bool,
     nebius_flag: bool,
     nebius_api_key: Optional[str],
     nebius_project_id: Optional[str],
@@ -511,6 +519,7 @@ def scan(
         introspect = True
         transitive = True
         verify_integrity = True
+        verify_instructions = True
     elif preset == "quick":
         transitive = False
         enrich = False
@@ -1495,6 +1504,65 @@ def scan(
             if unique_pkgs:
                 con.print(f"\n[bold blue]🔐 Verifying integrity for {len(unique_pkgs)} package(s)...[/bold blue]\n")
                 _asyncio.run(_verify_all())
+
+        # Step 4d: Instruction file provenance verification (optional)
+        if verify_instructions:
+            from agent_bom.integrity import discover_instruction_files, verify_instruction_files_batch
+
+            project_root = Path(project or ".").resolve()
+            instr_files = discover_instruction_files(project_root)
+            if instr_files:
+                con.print(f"\n[bold blue]🔏 Verifying instruction file provenance ({len(instr_files)} file(s))...[/bold blue]\n")
+                verifications = verify_instruction_files_batch(instr_files)
+                _instruction_provenance_data = []
+                for v in verifications:
+                    rel_path = (
+                        str(Path(v.file_path).relative_to(project_root)) if v.file_path.startswith(str(project_root)) else v.file_path
+                    )
+                    if v.verified:
+                        con.print(f"  [green]✓[/green] {rel_path} — provenance verified ({v.reason})")
+                    elif v.has_sigstore_bundle:
+                        con.print(f"  [yellow]⚠[/yellow] {rel_path} — bundle found but invalid ({v.reason})")
+                    else:
+                        con.print(f"  [dim]  {rel_path} — unsigned (sha256: {v.sha256[:12]}...)[/dim]")
+                    _instruction_provenance_data.append(
+                        {
+                            "file": rel_path,
+                            "sha256": v.sha256,
+                            "verified": v.verified,
+                            "has_bundle": v.has_sigstore_bundle,
+                            "signer": v.signer_identity,
+                            "rekor_index": v.rekor_log_index,
+                            "reason": v.reason,
+                        }
+                    )
+            else:
+                con.print("\n  [dim]No instruction files found to verify.[/dim]")
+
+        # Step 4e: Cortex agent observability (optional)
+        _cortex_telemetry_data = None
+        if cortex_observability and snowflake_flag:
+            try:
+                from agent_bom.cloud.snowflake import _get_connection
+                from agent_bom.cloud.snowflake_observability import get_cortex_telemetry
+
+                con.print("\n[bold blue]📊 Fetching Cortex agent observability telemetry...[/bold blue]\n")
+                sf_conn = _get_connection()
+                _cortex_telemetry_data = get_cortex_telemetry(sf_conn, hours=24)
+                sf_conn.close()
+
+                agent_count = len(_cortex_telemetry_data.get("agents", []))
+                if agent_count:
+                    con.print(f"  [green]✓[/green] {agent_count} Cortex agent(s) with telemetry")
+                    for ag in _cortex_telemetry_data["agents"]:
+                        status_color = {"healthy": "green", "degraded": "yellow", "unhealthy": "red"}.get(ag["health"]["status"], "dim")
+                        con.print(
+                            f"    [{status_color}]●[/{status_color}] {ag['name']}: {ag['total_calls']} calls, {ag['health']['status']}"
+                        )
+                else:
+                    con.print("  [dim]No Cortex agent telemetry found.[/dim]")
+            except Exception as exc:
+                con.print(f"  [yellow]⚠[/yellow] Cortex observability failed: {exc}")
 
     # Build report
     report = AIBOMReport(agents=agents, blast_radii=blast_radii)
