@@ -26,6 +26,12 @@
   </picture>
 </p>
 
+<p align="center">
+  <picture>
+    <img src="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/scan-output-dark.svg" alt="agent-bom scan output with GPU infrastructure scan" width="800" />
+  </picture>
+</p>
+
 ---
 
 ## Why agent-bom?
@@ -73,6 +79,7 @@ agent-bom scan --siem splunk --siem-url https://...  # Push findings to SIEM
 agent-bom scan --aws --snowflake --databricks      # Multi-cloud
 agent-bom scan --hf-model meta-llama/Llama-3.1-8B  # model provenance
 agent-bom scan --vector-db-scan                    # Scan self-hosted + Pinecone cloud vector DBs
+agent-bom scan --gpu-scan                          # Discover GPU containers + K8s nodes, detect unauthenticated DCGM exporters
 agent-bom graph report.json --format dot           # Export dependency graph (DOT/Mermaid/JSON)
 agent-bom proxy-configure --apply                  # Auto-wrap MCP configs with security proxy
 ```
@@ -371,7 +378,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full diagrams: data flow pi
 - [ ] LLM API call tracing (which model was called, with what context)
 
 **Identity / access**
-- [ ] IdP / OIDC integration (weakest current layer — no token validation or identity graph)
+- [x] OIDC/JWT auth for REST API (Okta, Google Workspace, Azure AD, Auth0, GitHub OIDC)
+- [ ] Agent-level identity — propagating caller identity through MCP tool chains
+- [ ] MCP server identity attestation — cryptographic proof of server identity at runtime
 - [ ] Agent-to-agent permission boundary enforcement
 
 **Compliance / standards**
