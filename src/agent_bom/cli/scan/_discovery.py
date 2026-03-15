@@ -127,7 +127,7 @@ def run_local_discovery(
         and not images
         and not k8s
         and not code_paths
-        and not project  # --project: package scan fallback runs below
+        and not project
         and not sbom_file
         and not tf_dirs
         and not gha_path
