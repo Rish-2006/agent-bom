@@ -409,6 +409,24 @@ def scan(
             else:
                 con.print("[dim]Offline mode — scanning against local DB only[/dim]")
 
+    # ── Auto-offline: use local DB if synced recently (saves ~10s network) ──
+    if not offline:
+        try:
+            import os
+            import time
+
+            from agent_bom.db.schema import DB_PATH
+
+            if DB_PATH.exists():
+                _age_days = (time.time() - os.path.getmtime(DB_PATH)) / 86400
+                if _age_days <= 1:
+                    import agent_bom.scanners as _scanners_auto
+
+                    _scanners_auto.prefer_local_db = True
+                    logger.debug("Local DB is %.1f day(s) old — preferring local DB over network", _age_days)
+        except Exception:
+            pass  # DB not available, will use network
+
     # ── Auto-refresh stale DB if requested ───────────────────────────────────
     if auto_update_db:
         from agent_bom.db.schema import db_freshness_days
