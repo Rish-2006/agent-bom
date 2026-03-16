@@ -136,7 +136,7 @@ def to_cyclonedx(report: AIBOMReport) -> dict:
                         )
                     vuln_entry: dict[str, object] = {
                         "id": vuln.id,
-                        "description": vuln.summary,
+                        "description": vuln.summary or f"See {vuln.id} for details",
                         "source": {"name": "OSV", "url": f"https://osv.dev/vulnerability/{vuln.id}"},
                         "ratings": ratings,
                         "affects": [{"ref": pkg_ref}],
@@ -164,7 +164,7 @@ def to_cyclonedx(report: AIBOMReport) -> dict:
     cdx = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
-        "serialNumber": f"urn:uuid:{uuid4()}",
+        "serialNumber": f"urn:uuid:{report.scan_id}" if report.scan_id else f"urn:uuid:{uuid4()}",
         "version": 1,
         "metadata": {
             "timestamp": report.generated_at.isoformat(),
