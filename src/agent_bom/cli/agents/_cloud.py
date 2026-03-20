@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_bom.cli.scan._context import ScanContext
+from agent_bom.cli.agents._context import ScanContext
 
 
 def run_cloud_discovery(
@@ -124,12 +124,7 @@ def run_cloud_discovery(
     _cloud_image_targets: list[tuple[str, Any]] = []  # (image_ref, MCPServer to populate)
     for agent in ctx.agents[_pre_cloud_idx:]:
         for server in agent.mcp_servers:
-            if (
-                server.command == "docker"
-                and len(server.args) >= 2
-                and server.args[0] == "run"
-                and not server.packages
-            ):
+            if server.command == "docker" and len(server.args) >= 2 and server.args[0] == "run" and not server.packages:
                 _cloud_image_targets.append((server.args[1], server))
 
     if _cloud_image_targets:

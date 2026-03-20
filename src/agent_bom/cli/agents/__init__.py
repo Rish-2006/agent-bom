@@ -2,7 +2,7 @@
 
 This package replaces the monolithic cli/scan.py. The public interface is
 identical: ``from agent_bom.cli.scan import scan`` still works, and all
-``patch("agent_bom.cli.scan.<symbol>", ...)`` targets remain importable from
+``patch("agent_bom.cli.agents.<symbol>", ...)`` targets remain importable from
 this namespace.
 """
 
@@ -22,12 +22,12 @@ from agent_bom.cli._common import (
     _make_console,
     logger,
 )
+from agent_bom.cli.agents._cloud import run_benchmarks, run_cloud_discovery
+from agent_bom.cli.agents._context import ScanContext
+from agent_bom.cli.agents._discovery import run_local_discovery
+from agent_bom.cli.agents._output import _format_text, render_output
+from agent_bom.cli.agents._post import compute_exit_code, run_integrations
 from agent_bom.cli.options import scan_options
-from agent_bom.cli.scan._cloud import run_benchmarks, run_cloud_discovery
-from agent_bom.cli.scan._context import ScanContext
-from agent_bom.cli.scan._discovery import run_local_discovery
-from agent_bom.cli.scan._output import _format_text, render_output
-from agent_bom.cli.scan._post import compute_exit_code, run_integrations
 from agent_bom.discovery import discover_all
 from agent_bom.models import AIBOMReport
 from agent_bom.output import (
@@ -668,7 +668,7 @@ def scan(
         os_packages=os_packages,
         iac_paths=iac_paths,
         _any_cloud=any_cloud,
-        _discover_all=discover_all,  # pass patchable reference — tests patch agent_bom.cli.scan.discover_all
+        _discover_all=discover_all,  # pass patchable reference — tests patch agent_bom.cli.agents.discover_all
     )
 
     ctx.step_timings["discovery"] = _time.monotonic() - _step_t0

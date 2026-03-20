@@ -68,23 +68,14 @@ def main():
 # Register subcommands from each module
 # ---------------------------------------------------------------------------
 
-from agent_bom.cli.scan import scan  # noqa: E402
+from agent_bom.cli.agents import scan as _agents_cmd  # noqa: E402
 
-# 'agents' is the primary command. 'scan' is a hidden backward-compat alias.
-# Both point to the same function — we register 'agents' visible and add
-# a hidden 'scan' group command that forwards via ctx.invoke.
-main.add_command(scan, "agents")
+# 'agents' is the primary visible command.
+main.add_command(_agents_cmd, "agents")
 
-
-@main.command("scan", hidden=True)
-@click.pass_context
-def _scan_compat(ctx: click.Context, **kwargs):  # type: ignore[no-untyped-def]
-    """Backward compat alias for 'agents'."""
-    ctx.invoke(scan, **kwargs)
-
-
-# Copy scan's params so --help works on the hidden alias too
-_scan_compat.params = list(scan.params)
+# 'scan' is the same command object, hidden from help for backward compat.
+# We register it directly (not a wrapper) so all 200+ params work identically.
+main.commands["scan"] = _agents_cmd
 
 from agent_bom.cli._inventory import completions_cmd, inventory, validate, where  # noqa: E402
 
@@ -197,7 +188,7 @@ main.add_command(mcp_group)
 # ---------------------------------------------------------------------------
 # Focused scan commands — `agent-bom image`, `agent-bom fs`, etc.
 # ---------------------------------------------------------------------------
-from agent_bom.cli._scan_commands import fs_cmd, iac_cmd, image_cmd, sbom_cmd  # noqa: E402
+from agent_bom.cli._focused_commands import fs_cmd, iac_cmd, image_cmd, sbom_cmd  # noqa: E402
 
 main.add_command(image_cmd)
 main.add_command(fs_cmd)
@@ -295,6 +286,12 @@ from agent_bom.cli._entry import make_entry_point  # noqa: E402
 
 # Use lambda with module lookup so unittest.mock.patch("agent_bom.cli.main") works
 cli_main = make_entry_point(lambda: _self_module.main, "agent-bom")
+
+
+# Re-export 'scan' as the Click command for backward-compat imports.
+# MUST be at the end — after all subpackage imports that might shadow
+# the 'scan' name with the scan/ subpackage module.
+scan = _agents_cmd  # noqa: F811
 
 
 __all__ = [

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_bom.cli._common import _build_agents_from_inventory
-from agent_bom.cli.scan._context import ScanContext
+from agent_bom.cli.agents._context import ScanContext
 from agent_bom.discovery import discover_all as _discover_all_default
 
 
@@ -70,7 +70,7 @@ def run_local_discovery(
     """Steps 1–1g4: discover agents from local sources, SBOM, images, etc."""
     from rich.rule import Rule
 
-    # Allow callers to inject discover_all (enables patch("agent_bom.cli.scan.discover_all"))
+    # Allow callers to inject discover_all (enables patch("agent_bom.cli.agents.discover_all"))
     _discover = _discover_all if _discover_all is not None else _discover_all_default
     con = ctx.con
     con.print(Rule("Discovery", style="blue"))

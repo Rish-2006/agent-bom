@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_bom.cli.scan._context import ScanContext
+from agent_bom.cli.agents._context import ScanContext
 from agent_bom.models import AIBOMReport
 from agent_bom.output import (
     export_badge,

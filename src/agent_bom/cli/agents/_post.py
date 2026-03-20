@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_bom.cli._common import SEVERITY_ORDER
-from agent_bom.cli.scan._context import ScanContext
+from agent_bom.cli.agents._context import ScanContext
 from agent_bom.output import to_json
 
 
