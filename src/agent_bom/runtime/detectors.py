@@ -11,12 +11,15 @@ Pluggable detectors that analyze MCP JSON-RPC traffic in real-time:
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 from agent_bom.runtime.patterns import (
     CREDENTIAL_PATTERNS,
@@ -72,14 +75,43 @@ class ToolDriftDetector:
 
     Compares the initial tools/list snapshot against subsequent ones.
     New tools that weren't in the initial set trigger HIGH alerts.
+    Persists baseline to disk so it survives engine restarts.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, restore: bool = False) -> None:
         self._baseline: set[str] | None = None
+        if restore:
+            self._restore_baseline()
+
+    @staticmethod
+    def _baseline_path() -> Path:
+        state_dir = Path(os.environ.get("AGENT_BOM_STATE_DIR", Path.home() / ".agent-bom"))
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / "drift_baseline.json"
+
+    def _persist_baseline(self) -> None:
+        try:
+            path = self._baseline_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(self._baseline or [])))
+            tmp.replace(path)
+        except OSError:
+            pass
+
+    def _restore_baseline(self) -> None:
+        try:
+            path = self._baseline_path()
+            if path.exists():
+                tools = json.loads(path.read_text())
+                if isinstance(tools, list):
+                    self._baseline = set(tools)
+        except (OSError, json.JSONDecodeError):
+            pass
 
     def set_baseline(self, tools: list[str]) -> None:
         """Set the initial tool baseline from the first tools/list response."""
         self._baseline = set(tools)
+        self._persist_baseline()
 
     def check(self, current_tools: list[str]) -> list[Alert]:
         """Compare current tools against baseline. Returns alerts for new tools."""
@@ -247,10 +279,11 @@ class CredentialLeakDetector:
 
 
 class RateLimitTracker:
-    """Track tool call rates and alert on excessive usage.
+    """Track tool call rates and block on excessive usage.
 
-    Uses a sliding window to track calls per tool. Alerts when any tool
-    exceeds the configured threshold within the window.
+    Uses a sliding window to track calls per tool. When any tool exceeds
+    the threshold, returns a CRITICAL alert with ``blocked=True`` so the
+    caller can enforce the rate limit (zero trust — deny by default).
     """
 
     def __init__(self, threshold: int = 50, window_seconds: float = 60.0) -> None:
@@ -259,7 +292,11 @@ class RateLimitTracker:
         self._calls: dict[str, deque[float]] = {}
 
     def record(self, tool_name: str) -> list[Alert]:
-        """Record a tool call and check rate limits."""
+        """Record a tool call and check rate limits.
+
+        Returns a CRITICAL alert with ``details.blocked = True`` when the
+        rate limit is exceeded, signaling the caller to deny the call.
+        """
         now = time.monotonic()
         if tool_name not in self._calls:
             self._calls[tool_name] = deque()
@@ -273,16 +310,20 @@ class RateLimitTracker:
 
         alerts: list[Alert] = []
         if len(q) >= self._threshold:
+            # Escalate severity based on how far over the limit
+            over_ratio = len(q) / self._threshold
+            severity = AlertSeverity.CRITICAL if over_ratio >= 2.0 else AlertSeverity.HIGH
             alerts.append(
                 Alert(
                     detector="rate_limit",
-                    severity=AlertSeverity.MEDIUM,
-                    message=f"Excessive tool calls: {tool_name} called {len(q)} times in {self._window}s (threshold: {self._threshold})",
+                    severity=severity,
+                    message=f"Rate limit exceeded: {tool_name} called {len(q)} times in {self._window}s (threshold: {self._threshold})",
                     details={
                         "tool": tool_name,
                         "count": len(q),
                         "threshold": self._threshold,
                         "window_seconds": self._window,
+                        "blocked": True,
                     },
                 )
             )
