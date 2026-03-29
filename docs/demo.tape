@@ -1,4 +1,4 @@
-# agent-bom v0.75.10 hero demo
+# agent-bom v0.75.11 hero demo
 # Shows: scan with blast radius → pre-install check → integrity verify
 
 Output docs/images/demo-latest.gif
@@ -15,4 +15,4 @@ Set PlaybackSpeed 1.2
 # Hero flow — render_demo.sh handles TERM=xterm-256color for Rich colors
 Type "bash scripts/render_demo.sh"
 Enter
-Sleep 15s
+Sleep 30s
