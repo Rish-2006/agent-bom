@@ -8,14 +8,31 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from agent_bom.finding import Finding
+
+from agent_bom.advisory_sources import merge_advisory_sources
 
 # ─── Package name normalization ──────────────────────────────────────────────
 # PEP 503: https://peps.python.org/pep-0503/#normalized-names
 # Ensures consistent matching across parsers, scanners, and cache.
 _NORMALIZE_RE = re.compile(r"[-_.]+")
+
+
+def _reference_host_and_path(reference: str) -> tuple[str, str]:
+    """Return normalized hostname and path for a reference URL."""
+    try:
+        parsed = urlparse(reference)
+    except ValueError:
+        return "", ""
+    return (parsed.hostname or "").lower(), (parsed.path or "").lower()
+
+
+def _host_matches_domain(host: str, domain: str) -> bool:
+    """Return True when host equals domain or is a subdomain of it."""
+    return host == domain or host.endswith(f".{domain}")
 
 
 def normalize_package_name(name: str, ecosystem: str = "") -> str:
@@ -148,9 +165,11 @@ class Vulnerability:
     compliance_tags: dict[str, list[str]] = field(
         default_factory=dict
     )  # CVE-level framework tags, e.g. {"nist_csf": ["ID.RA-01"], "cis": ["CIS-02.3"]}
+    advisory_sources: list[str] = field(default_factory=list)  # osv / ghsa / nvidia_csaf / nvd / epss / cisa_kev
 
     def __post_init__(self) -> None:
         """Sanitize fixed_version — filter git SHAs and non-version strings."""
+        self.advisory_sources = merge_advisory_sources(*self.advisory_sources)
         if self.fixed_version:
             v = self.fixed_version.lstrip("v")
             # Git SHA (40 hex chars)
@@ -174,6 +193,48 @@ class Vulnerability:
         from agent_bom.config import EPSS_ACTIVE_EXPLOITATION_THRESHOLD
 
         return self.is_kev or (self.epss_score is not None and self.epss_score > EPSS_ACTIVE_EXPLOITATION_THRESHOLD)
+
+    @property
+    def all_advisory_sources(self) -> list[str]:
+        """Return advisory + enrichment sources that contributed to this finding."""
+        derived_sources: list[str | None] = []
+        if self.id.startswith("GHSA-") or any(alias.startswith("GHSA-") for alias in self.aliases):
+            derived_sources.append("ghsa")
+        if self.references:
+            ref_hosts_paths = [_reference_host_and_path(ref) for ref in self.references]
+            if any(
+                host == "github.com" and (path.startswith("/advisories/") or path.startswith("/advisory/"))
+                for host, path in ref_hosts_paths
+            ):
+                derived_sources.append("ghsa")
+            if any(
+                _host_matches_domain(host, "nvidia.com") or _host_matches_domain(host, "nvidia.github.io")
+                for host, _path in ref_hosts_paths
+            ):
+                derived_sources.append("nvidia_csaf")
+            if any(host == "nvd.nist.gov" for host, _path in ref_hosts_paths):
+                derived_sources.append("nvd")
+        if self.nvd_status or self.nvd_published or self.nvd_modified:
+            derived_sources.append("nvd")
+        if self.epss_score is not None:
+            derived_sources.append("epss")
+        if self.is_kev:
+            derived_sources.append("cisa_kev")
+        return merge_advisory_sources(*self.advisory_sources, *derived_sources)
+
+    @property
+    def advisory_coverage_state(self) -> str:
+        """Summarize whether the finding is primary-only or enrichment-backed."""
+        sources = self.all_advisory_sources
+        has_primary = any(source in {"osv", "ghsa", "nvidia_csaf"} for source in sources)
+        has_enrichment = any(source in {"nvd", "epss", "cisa_kev"} for source in sources)
+        if has_primary and has_enrichment:
+            return "enriched"
+        if has_primary:
+            return "primary_only"
+        if has_enrichment:
+            return "enrichment_only"
+        return "unknown"
 
     @property
     def risk_level(self) -> str:
