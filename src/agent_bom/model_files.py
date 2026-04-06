@@ -7,7 +7,10 @@ Detects common model file formats and flags security risks
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,68 @@ _SECURITY_FLAGS: dict[str, dict] = {
 }
 
 _UNSAFE_MODEL_EXTENSIONS = frozenset({".pt", ".pth", ".pkl", ".joblib", ".bin"})
+_MODEL_INDEX_FILENAMES = frozenset({"model.safetensors.index.json", "pytorch_model.bin.index.json"})
+_MODEL_MANIFEST_FILENAMES = frozenset({"config.json", "tokenizer_config.json", "adapter_config.json"})
+
+
+def _extract_repo_reference(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or candidate.startswith("/"):
+        return None
+    return candidate if "/" in candidate else None
+
+
+def _safe_resolve_directory(directory: str | Path) -> Path:
+    """Resolve a scan root and constrain it to known-safe local roots.
+
+    Allowed roots:
+    - current user's home directory
+    - current working directory
+    - system temp directory
+    - optional extra roots from AGENT_BOM_SAFE_SCAN_ROOTS (os.pathsep-separated)
+    """
+    raw_directory = os.fspath(directory).strip()
+    if not raw_directory:
+        raise ValueError("Directory is empty")
+
+    expanded = os.path.expanduser(raw_directory)
+    if os.path.isabs(expanded):
+        candidate = os.path.realpath(expanded)
+    else:
+        candidate = os.path.realpath(os.path.join(os.getcwd(), expanded))
+
+    allowed_roots = {
+        os.path.realpath(str(Path.home())),
+        os.path.realpath(str(Path.cwd())),
+        os.path.realpath(tempfile.gettempdir()),
+    }
+
+    extra_roots = os.environ.get("AGENT_BOM_SAFE_SCAN_ROOTS", "")
+    for root in extra_roots.split(os.pathsep):
+        root = root.strip()
+        if root:
+            allowed_roots.add(os.path.realpath(root))
+
+    if not any(os.path.commonpath([root, candidate]) == root for root in allowed_roots):
+        raise ValueError(f"Directory escapes safe scan roots: {candidate}")
+
+    return Path(candidate)
+
+
+def _allowed_scan_roots() -> list[str]:
+    roots = {
+        os.path.realpath(str(Path.home())),
+        os.path.realpath(str(Path.cwd())),
+        os.path.realpath(tempfile.gettempdir()),
+    }
+    extra_roots = os.environ.get("AGENT_BOM_SAFE_SCAN_ROOTS", "")
+    for root in extra_roots.split(os.pathsep):
+        root = root.strip()
+        if root:
+            roots.add(os.path.realpath(root))
+    return sorted(roots)
 
 
 def _human_size(size_bytes: int | float) -> str:
@@ -71,7 +136,11 @@ def scan_model_files(
 
     Warnings are generated for security-relevant findings (e.g., pickle files).
     """
-    directory = Path(directory)
+    try:
+        directory = _safe_resolve_directory(directory)
+    except ValueError as exc:
+        logger.warning("Model scan refused: %s", exc)
+        return [], [f"Model scan: {exc}"]
     if not directory.is_dir():
         return [], [f"Model scan: {directory} is not a directory"]
 
@@ -116,6 +185,144 @@ def scan_model_files(
             )
 
     return results, warnings
+
+
+def scan_model_manifests(
+    directory: str | Path,
+) -> tuple[list[dict], list[str]]:
+    """Scan a directory for model bundle manifests and lineage metadata."""
+    raw_directory = os.fspath(directory).strip()
+    if not raw_directory:
+        return [], ["Model manifest scan: directory is empty"]
+
+    expanded = os.path.expanduser(raw_directory)
+    resolved_input = os.path.realpath(expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded))
+
+    matched_root = None
+    scan_root = None
+    for safe_root in _allowed_scan_roots():
+        try:
+            relative = os.path.relpath(resolved_input, safe_root)
+        except ValueError:
+            continue
+        scan_candidate = os.path.normpath(os.path.join(safe_root, relative))
+        if os.path.commonpath([safe_root, scan_candidate]) != safe_root:
+            continue
+        if scan_candidate != resolved_input:
+            continue
+        matched_root = safe_root
+        scan_root = scan_candidate
+        break
+
+    if matched_root is None or scan_root is None:
+        logger.warning("Model manifest scan refused outside safe roots")
+        return [], [f"Model manifest scan: Directory escapes safe scan roots: {resolved_input}"]
+
+    manifests: list[dict] = []
+    warnings: list[str] = []
+    scan_root_prefix = scan_root + os.sep
+    target_found = False
+
+    for root, dirs, files in os.walk(matched_root):
+        root = os.path.normpath(root)
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+        if root == scan_root:
+            target_found = True
+        elif root.startswith(scan_root_prefix):
+            target_found = True
+        elif scan_root.startswith(root + os.sep):
+            rel_to_target = os.path.relpath(scan_root, root)
+            next_segment = rel_to_target.split(os.sep, 1)[0]
+            dirs[:] = [d for d in dirs if d == next_segment]
+            continue
+        else:
+            dirs[:] = []
+            continue
+
+        if any(part.startswith(".") for part in Path(root).parts):
+            continue
+        for filename in sorted(files):
+            if not filename.endswith(".json"):
+                continue
+
+            file_path = os.path.normpath(os.path.join(root, filename))
+            if os.path.commonpath([scan_root, file_path]) != scan_root:
+                continue
+            file_name = os.path.basename(file_path)
+            if any(part.startswith(".") for part in Path(file_path).parts):
+                continue
+            if file_name not in _MODEL_INDEX_FILENAMES and file_name not in _MODEL_MANIFEST_FILENAMES:
+                continue
+
+            try:
+                with open(file_path, encoding="utf-8", errors="replace") as handle:
+                    payload_raw = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload_raw, dict):
+                continue
+            payload = payload_raw
+
+            manifest_type = "config"
+            repo_id = _extract_repo_reference(payload.get("_name_or_path")) or _extract_repo_reference(payload.get("name_or_path"))
+            base_model_id = None
+            shard_count = 0
+            security_flags: list[dict] = []
+
+            if file_name in _MODEL_INDEX_FILENAMES:
+                manifest_type = "weight_index"
+                weight_map = payload.get("weight_map", {})
+                if isinstance(weight_map, dict):
+                    shard_count = len({str(v) for v in weight_map.values() if isinstance(v, str)})
+                if not shard_count:
+                    security_flags.append(
+                        {
+                            "severity": "MEDIUM",
+                            "type": "EMPTY_WEIGHT_INDEX",
+                            "description": "Weight index manifest has no shard mapping; bundle integrity cannot be confirmed.",
+                        }
+                    )
+            elif file_name == "adapter_config.json":
+                manifest_type = "adapter"
+                base_model_id = _extract_repo_reference(payload.get("base_model_name_or_path"))
+                if not base_model_id:
+                    security_flags.append(
+                        {
+                            "severity": "MEDIUM",
+                            "type": "MISSING_BASE_MODEL",
+                            "description": "Adapter manifest does not declare a base model lineage reference.",
+                        }
+                    )
+            elif file_name == "tokenizer_config.json":
+                manifest_type = "tokenizer"
+
+            model_type = payload.get("model_type") if isinstance(payload.get("model_type"), str) else None
+            architectures = payload.get("architectures") if isinstance(payload.get("architectures"), list) else []
+            metadata = payload.get("metadata")
+            total_size = metadata.get("total_size") if isinstance(metadata, dict) and isinstance(metadata.get("total_size"), int) else None
+
+            manifest = {
+                "path": file_path,
+                "filename": file_name,
+                "manifest_type": manifest_type,
+                "repo_id": repo_id,
+                "base_model_id": base_model_id,
+                "model_type": model_type,
+                "architectures": architectures,
+                "shard_count": shard_count,
+                "total_size_bytes": total_size,
+                "security_flags": security_flags,
+            }
+            manifests.append(manifest)
+
+            for flag in security_flags:
+                warnings.append(f"Model manifest {file_name}: {flag['severity']} — {flag['type']}. {flag['description']}")
+
+    if not target_found:
+        return [], [f"Model manifest scan: {scan_root} is not a directory"]
+
+    return manifests, warnings
 
 
 # ── Model weight provenance ─────────────────────────────────────
@@ -316,6 +523,7 @@ def summarize_model_supply_chain(
     model_files: list[dict],
     model_provenance: list[dict] | None = None,
     model_hash_verification: dict | None = None,
+    model_manifests: list[dict] | None = None,
 ) -> dict:
     """Build a stable summary of model/weight supply-chain coverage.
 
@@ -325,6 +533,7 @@ def summarize_model_supply_chain(
     """
     provenance = model_provenance or []
     hash_verification = model_hash_verification or {}
+    manifests = model_manifests or []
 
     files_with_flags = 0
     signed_files = 0
@@ -355,6 +564,7 @@ def summarize_model_supply_chain(
     provenance_with_digest = sum(1 for item in provenance if item.get("has_digest") is True or item.get("sha256_available") is True)
     gated_models = sum(1 for item in provenance if item.get("is_gated") is True or item.get("gated") is True)
     sources = sorted({str(item.get("source", "huggingface")) for item in provenance})
+    manifest_types = sorted({str(item.get("manifest_type")) for item in manifests if item.get("manifest_type")})
 
     return {
         "model_files": len(model_files),
@@ -370,6 +580,12 @@ def summarize_model_supply_chain(
         "gated_models": gated_models,
         "provenance_with_security_flags": provenance_with_flags,
         "provenance_sources": sources,
+        "manifest_files": len(manifests),
+        "manifest_types": manifest_types,
+        "manifests_with_repo_id": sum(1 for item in manifests if item.get("repo_id")),
+        "adapter_lineage_refs": sum(1 for item in manifests if item.get("base_model_id")),
+        "sharded_bundles": sum(1 for item in manifests if int(item.get("shard_count", 0) or 0) > 0),
+        "manifests_with_security_flags": sum(1 for item in manifests if item.get("security_flags")),
         "hash_verification": {
             "scanned": int(hash_verification.get("scanned", 0) or 0),
             "verified": int(hash_verification.get("verified", 0) or 0),
