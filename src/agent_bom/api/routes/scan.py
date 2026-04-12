@@ -120,6 +120,23 @@ def _visible_to_tenant(job: ScanJob, tenant_id: str) -> bool:
     return getattr(job, "tenant_id", "default") == tenant_id
 
 
+def _job_summary_payload(job: ScanJob) -> dict[str, Any]:
+    """Build a lightweight summary payload for list surfaces."""
+    result = job.result if isinstance(job.result, dict) else {}
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else None
+    return {
+        "job_id": job.job_id,
+        "tenant_id": job.tenant_id,
+        "status": job.status,
+        "created_at": job.created_at,
+        "completed_at": job.completed_at,
+        "request": job.request.model_dump(exclude_defaults=True, exclude_none=True),
+        "summary": summary,
+        "scan_timestamp": result.get("scan_timestamp"),
+        "pushed": bool(result.get("pushed")),
+    }
+
+
 def _job_for_request(request: Request, job_id: str) -> ScanJob:
     tenant_id = _tenant_id(request)
     in_mem = _jobs_get(job_id)
@@ -481,12 +498,24 @@ async def list_jobs(request: Request, limit: int = 50, offset: int = 0) -> dict:
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     tenant_id = _tenant_id(request)
-    summary = [j for j in _get_store().list_summary() if j.get("tenant_id", "default") == tenant_id]
+    store = _get_store()
+    summary = [j for j in store.list_summary() if j.get("tenant_id", "default") == tenant_id]
     total = len(summary)
     page = summary[offset : offset + limit]
+    enriched: list[dict[str, Any]] = []
+    for item in page:
+        # Keep list surfaces compatible with lightweight stores and tests that
+        # only implement paged summaries. Hydrate when available, otherwise
+        # return the summary row unchanged.
+        try:
+            get_job = getattr(store, "get", None)
+            full_job = get_job(item["job_id"]) if callable(get_job) else None
+        except Exception:
+            full_job = None
+        enriched.append(_job_summary_payload(full_job) if isinstance(full_job, ScanJob) else item)
     return {
-        "jobs": page,
-        "count": len(page),
+        "jobs": enriched,
+        "count": len(enriched),
         "total": total,
         "limit": limit,
         "offset": offset,
