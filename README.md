@@ -188,7 +188,7 @@ docker run --rm agentbom/agent-bom agents    # Docker
 | Mode | Command | Best for |
 |------|---------|----------|
 | CLI | `agent-bom agents` | Local audit + project scan |
-| GitHub Action | `uses: msaad00/agent-bom@v0.76.2` | CI/CD + SARIF |
+| GitHub Action | `uses: msaad00/agent-bom@v0.76.4` | CI/CD + SARIF |
 | Docker | `docker run agentbom/agent-bom` | Isolated scans |
 | MCP Server | `agent-bom mcp server` | Claude Desktop, Claude Code, Cursor, Codex, Windsurf, Cortex |
 | Runtime proxy | `agent-bom proxy` | MCP traffic enforcement |
@@ -207,7 +207,7 @@ Use the GitHub Action when you want a fast CI gate: one step, one gate, SARIF in
 **Repo + MCP + instruction files**
 
 ```yaml
-- uses: msaad00/agent-bom@v0.76.2
+- uses: msaad00/agent-bom@v0.76.4
   with:
     scan-type: scan
     severity-threshold: high
@@ -219,7 +219,7 @@ Use the GitHub Action when you want a fast CI gate: one step, one gate, SARIF in
 **Container image gate**
 
 ```yaml
-- uses: msaad00/agent-bom@v0.76.2
+- uses: msaad00/agent-bom@v0.76.4
   with:
     scan-type: image
     scan-ref: ghcr.io/acme/agent-runtime:sha-abcdef
@@ -229,7 +229,7 @@ Use the GitHub Action when you want a fast CI gate: one step, one gate, SARIF in
 **IaC gate**
 
 ```yaml
-- uses: msaad00/agent-bom@v0.76.2
+- uses: msaad00/agent-bom@v0.76.4
   with:
     scan-type: iac
     iac: Dockerfile,k8s/,infra/main.tf
@@ -239,7 +239,7 @@ Use the GitHub Action when you want a fast CI gate: one step, one gate, SARIF in
 **Air-gapped / pre-synced CI**
 
 ```yaml
-- uses: msaad00/agent-bom@v0.76.2
+- uses: msaad00/agent-bom@v0.76.4
   with:
     auto-update-db: false
     enrich: false
@@ -269,7 +269,9 @@ See [docs/ENTERPRISE_DEPLOYMENT.md](docs/ENTERPRISE_DEPLOYMENT.md) for rollout p
 <details>
 <summary><b>Output formats</b></summary>
 
-JSON, SARIF, CycloneDX 1.6 (with ML BOM), SPDX 3.0, HTML, Graph JSON, Graph HTML, GraphML, Neo4j Cypher, JUnit XML, CSV, Markdown, Mermaid, SVG, Prometheus, Badge, OCSF, Attack Flow, plain text.
+JSON, SARIF, CycloneDX 1.6 (with ML BOM), SPDX 3.0, HTML, Graph JSON, Graph HTML, GraphML, Neo4j Cypher, JUnit XML, CSV, Markdown, Mermaid, SVG, Prometheus, Badge, Attack Flow, plain text.
+
+OCSF is currently used for runtime and SIEM event delivery, not as a general `-f ocsf` report format.
 
 </details>
 
