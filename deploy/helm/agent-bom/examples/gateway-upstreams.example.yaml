@@ -1,0 +1,55 @@
+# Example upstreams config for `agent-bom gateway serve`.
+#
+# This file is OPERATOR-AUTHORED — the gateway has no way to auto-discover
+# the MCP servers your team uses; you list them here once, then laptops
+# point at https://agent-bom-gateway.example.com/mcp/{server-name} for every
+# MCP. The `name` field is the routing key (used in the URL); the `url` is
+# where the gateway actually forwards the request. One URL template for the
+# whole org, no per-laptop proxy install.
+#
+# ── How to use ───────────────────────────────────────────────────────────────
+# 1. Copy this file, replace the example upstreams with YOUR MCPs.
+# 2. Put any bearer tokens into Kubernetes Secrets (NOT in this file — bearer
+#    tokens are pulled from env vars at runtime via `token_env`).
+# 3. Point Helm at your customised file:
+#
+#      helm upgrade agent-bom deploy/helm/agent-bom \
+#        --reuse-values \
+#        --set gateway.enabled=true \
+#        --set-file gateway.upstreamsYaml=./my-upstreams.yaml
+#
+# 4. Configure the token env vars via `gateway.envFrom` in values.yaml
+#    pointing at a Secret that exposes them. The gateway pod reads them
+#    at startup — rotate by updating the Secret + `kubectl rollout restart`.
+#
+# ── Supported auth modes ─────────────────────────────────────────────────────
+#   auth: none            — no credential injection (use for in-cluster MCPs)
+#   auth: bearer          — gateway reads `token_env` and sets Authorization
+#                           header on every upstream request
+#   auth: oauth2_client_credentials  (roadmap — see MULTI_MCP_GATEWAY.md)
+#
+# Replace the three examples below with your real MCP inventory.
+
+upstreams:
+  # EXAMPLE 1 — Snowflake-hosted MCP (e.g. a jira MCP in a Snowflake
+  # container service or Cortex function exposed over HTTPS). The gateway
+  # injects the Snowflake token; the laptop never holds it.
+  - name: jira
+    url: https://snowflake.example.internal/mcp/jira
+    auth: bearer
+    token_env: SNOWFLAKE_JIRA_MCP_TOKEN
+    headers:
+      X-Agent-Bom-Client: agent-bom-gateway
+
+  # EXAMPLE 2 — A remote GitHub MCP server behind an internal ingress.
+  - name: github
+    url: https://mcp.github.example.com/sse
+    auth: bearer
+    token_env: GITHUB_MCP_TOKEN
+
+  # EXAMPLE 3 — An in-cluster MCP workload in a sibling namespace. No
+  # external auth needed — the gateway is the authed front door and
+  # Kubernetes NetworkPolicy restricts direct access.
+  - name: filesystem-review-env
+    url: http://review-fs.agent-bom-workloads.svc.cluster.local:8100
+    auth: none
