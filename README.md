@@ -584,3 +584,10 @@ pytest && ruff check src/
 ---
 
 Apache 2.0 — [LICENSE](LICENSE)
+### 🚀 Quick Start
+Once you have cloned the repository, you can run a demo scan to see how `agent-bom` works:
+
+```bash
+# Run a demo scan to discover local AI agents and MCP servers
+agent-bom agents --demo
+```
