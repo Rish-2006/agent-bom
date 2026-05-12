@@ -112,6 +112,10 @@ docker compose -f docker-compose.pilot.yml up -d
 # Dashboard -> http://localhost:3000
 ```
 
+
+
+
+
 Recommended full self-hosted path in your own AWS / EKS:
 
 ```bash
