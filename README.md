@@ -638,6 +638,8 @@ Marketplace and agentic surfaces: [Glama](https://glama.ai/mcp/servers/@msaad00/
 
 JSON · SARIF · CycloneDX 1.6 (with ML BOM) · SPDX 3.0 · HTML · Graph JSON · Graph HTML · GraphML · Neo4j Cypher · JUnit XML · CSV · Markdown · Mermaid · SVG · Prometheus · Badge · Attack Flow · plain text. OCSF is used for runtime / SIEM event delivery, not as a general report format.
 
+
+
 </details>
 
 ## Contributing
