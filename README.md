@@ -191,6 +191,12 @@ Fix-first attack paths stay explicit: the page starts with the highest-risk path
 
 Root-centered graph drilldown keeps traversal bounded and readable: reachable node counts, affected entity types, bounded paths, filters, and evidence export are visible before broader topology review.
 
+
+
+
+
+
+
 ![agent-bom lineage graph root investigation](https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/lineage-graph-live.png)
 
 ### Dependency map
