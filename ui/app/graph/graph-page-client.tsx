@@ -17,6 +17,7 @@ import { AlertTriangle, Loader2, Route, ShieldAlert } from "lucide-react";
 
 import { AttackPathCard } from "@/components/attack-path-card";
 import { GraphEvidenceExportButton, GraphLegend, FullscreenButton } from "@/components/graph-chrome";
+import { LargeGraphOverview } from "@/components/large-graph-overview";
 import { LineageDetailPanel } from "@/components/lineage-detail";
 import {
   GraphControlGroup,
@@ -85,6 +86,11 @@ import {
   type UnifiedGraphResponse,
 } from "@/lib/api";
 import { buildUnifiedFlowGraph } from "@/lib/unified-graph-flow";
+import {
+  LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD,
+  LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD,
+  shouldUseLargeGraphOverview,
+} from "@/lib/large-graph-overview";
 import {
   applyFilters,
   decodeFiltersFromParams,
@@ -906,9 +912,10 @@ function GraphPageInner() {
     clusterCount: aggregated.clusters.size,
   });
 
-  const displayNodes = useMemo(() => {
+  const lineageLayoutNodes = layoutNodes as Node<LineageNodeData>[];
+  const displayNodes = useMemo<Node<LineageNodeData>[]>(() => {
     if (attackPathNodeIds) {
-      return layoutNodes.map((node) => {
+      return lineageLayoutNodes.map((node) => {
         const inPath = attackPathNodeIds.has(node.id);
         return {
           ...node,
@@ -923,7 +930,7 @@ function GraphPageInner() {
       });
     }
     if (reachabilitySummary) {
-      return layoutNodes.map((node) => {
+      return lineageLayoutNodes.map((node) => {
         const inReach = reachabilitySummary.nodeIds.has(node.id);
         const isRoot = node.id === reachabilitySummary.rootId;
         return {
@@ -939,7 +946,7 @@ function GraphPageInner() {
       });
     }
     if (!localNeighborhoodIds) {
-      return layoutNodes.map((node) => ({
+      return lineageLayoutNodes.map((node) => ({
         ...node,
         data: {
           ...node.data,
@@ -947,7 +954,7 @@ function GraphPageInner() {
         },
       }));
     }
-    return layoutNodes.map((node) => {
+    return lineageLayoutNodes.map((node) => {
       const isFocused = node.id === activeFocusId;
       const isConnected = localNeighborhoodIds.has(node.id);
       const dimmed = !isConnected;
@@ -962,7 +969,7 @@ function GraphPageInner() {
         },
       };
     });
-  }, [layoutNodes, localNeighborhoodIds, attackPathNodeIds, reachabilitySummary, activeFocusId, effectiveLodBand]);
+  }, [lineageLayoutNodes, localNeighborhoodIds, attackPathNodeIds, reachabilitySummary, activeFocusId, effectiveLodBand]);
 
   const compressedGroupCount = aggregatedClusterNodes.length;
   const compressedNodeCount = useMemo(
@@ -1056,6 +1063,14 @@ function GraphPageInner() {
   );
 
   const graphOnlyFindings = displayNodes.length > 0 && !hasContextualGraph;
+  const useLargeGraphOverview = shouldUseLargeGraphOverview({
+    nodeCount: displayNodes.length,
+    edgeCount: displayEdges.length,
+    captureMode,
+    selectedAttackPath: Boolean(selectedAttackPath),
+    reachabilityActive: Boolean(reachabilitySummary),
+    graphOnlyFindings,
+  });
   const graphPanelError = error && snapshots.length > 0 ? graphErrorState(error) : null;
   const findingNodes = useMemo(
     () =>
@@ -1140,6 +1155,12 @@ function GraphPageInner() {
     setPinnedFocusId((current) => (current === node.id ? null : node.id));
     setHoveredNodeId(null);
   }, [loadReachabilityDrillIn]);
+
+  const onLargeGraphNodeSelect = useCallback((nodeId: string) => {
+    const node = displayNodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    onNodeClick({} as React.MouseEvent, node);
+  }, [displayNodes, onNodeClick]);
 
   const onNodeMouseEnter = useCallback((_event: React.MouseEvent, node: Node) => {
     setHoveredNodeId(node.id);
@@ -1621,6 +1642,7 @@ function GraphPageInner() {
             <li>Node IDs are stable identifiers inside the graph model; the detail panel shows the node ID, first seen, last seen, sources, and edge counts.</li>
             <li>Pagination changes the visible canvas, not the persisted snapshot itself. Narrow the scope when the graph gets large; page when you need broader coverage.</li>
             <li>Relevant paths is for operator triage. Expanded is for topology review. Attack-path cards are the fix-first shortlist, not the whole graph.</li>
+            <li>Pages at or above {LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD.toLocaleString()} visible nodes or {LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD.toLocaleString()} visible edges use the limited 2D overview. Narrowing, search results, attack-path focus, and reachability drill-ins return to React Flow.</li>
             <li>Hop depth controls how far traversal can move from the selected agent or root. Entity layers control what kinds of nodes can render, without changing the persisted graph.</li>
           </ul>
         </details>
@@ -1773,6 +1795,13 @@ function GraphPageInner() {
               onExpandScope={() =>
                 setFilters(createExpandedGraphFilters(filters.agentName ?? flow.agentNames[0] ?? null))
               }
+            />
+          ) : useLargeGraphOverview ? (
+            <LargeGraphOverview
+              nodes={displayNodes}
+              edges={displayEdges}
+              legendItems={legendItems}
+              onNodeSelect={onLargeGraphNodeSelect}
             />
           ) : (
             <ReactFlow
