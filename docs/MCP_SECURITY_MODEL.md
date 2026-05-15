@@ -150,7 +150,7 @@ An agent operating autonomously can be steered into a multi-step exfiltration se
 │  2. PROXY         Sits between client and server, intercepts     │
 │     (agent-bom proxy) every JSON-RPC message, enforces policy    │
 │                                                                  │
-│  3. MCP SERVER    Exposes 36 scan/governance tools to any agent  │
+│  3. MCP SERVER    Exposes 37 scan/governance tools to any agent  │
 │     (agent-bom mcp server)  — scan, check, registry, compliance  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -210,7 +210,7 @@ For cross-agent correlation, use the broader runtime protection engine (`agent-b
 agent-bom mcp server
 ```
 
-Exposes 36 tools to any MCP-compatible AI assistant. Your agent can run scans, check packages, query the registry, and generate compliance reports without leaving the chat:
+Exposes 37 tools to any MCP-compatible AI assistant. Your agent can run scans, check packages, query ExposurePaths, query the registry, and generate compliance reports without leaving the chat:
 
 ```
 scan                — full discovery + scan, returns JSON report
