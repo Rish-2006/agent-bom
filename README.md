@@ -581,6 +581,9 @@ pytest && ruff check src/
 
 [CONTRIBUTING.md](CONTRIBUTING.md) · [docs/CLI_DEBUG_GUIDE.md](docs/CLI_DEBUG_GUIDE.md) · [SECURITY.md](SECURITY.md) · [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
+
+
+
 ---
 
 Apache 2.0 — [LICENSE](LICENSE)
@@ -590,4 +593,10 @@ Once you have cloned the repository, you can run a demo scan to see how `agent-b
 ```bash
 # Run a demo scan to discover local AI agents and MCP servers
 agent-bom agents --demo
+```
+
+### Local Setup
+To install this project locally for development, use the package manager:
+```bash
+uv pip install -e .
 ```
