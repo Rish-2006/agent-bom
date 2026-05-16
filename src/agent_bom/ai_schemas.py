@@ -9,6 +9,7 @@ Used to:
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
+from typing import Literal
 
 
 class BlastRadiusAnalysis(BaseModel):
@@ -27,7 +28,7 @@ class BlastRadiusAnalysis(BaseModel):
 class ExecutiveSummary(BaseModel):
     """Structured output for executive summary."""
 
-    risk_rating: str = Field(description="Critical, High, Medium, or Low")
+    risk_rating: Literal["Critical", "High", "Medium", "Low"] = Field(description="Strict rating selection: Critical, High, Medium, or Low")
     summary: str = Field(description="4-6 sentence executive summary for leadership")
     recommended_actions: list[str] = Field(description="Top 1-3 recommended actions")
 
