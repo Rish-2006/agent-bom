@@ -10,6 +10,7 @@ Endpoints:
   GET  /v1/graph/impact         — blast radius of a node (reverse BFS)
   GET  /v1/graph/search         — full-text graph search
   GET  /v1/graph/agents         — paginated agent node selector
+  GET  /v1/graph/clusters       — semantic cluster rollups
   POST /v1/graph/query          — programmable traversal query
   GET  /v1/graph/node/{id}      — single node detail with edges + impact
   GET  /v1/graph/snapshots      — list persisted scan snapshots
@@ -35,6 +36,7 @@ from pydantic import BaseModel, Field
 from agent_bom.api.stores import _get_graph_store
 from agent_bom.backpressure import BackpressureRejectedError, adaptive_backpressure
 from agent_bom.graph import SEVERITY_RANK, AttackPath, EntityType, GraphFilterOptions, GraphSemanticLayer, RelationshipType, UnifiedGraph
+from agent_bom.graph.semantic_clusters import SEMANTIC_CLUSTER_KINDS, build_semantic_clusters, semantic_cluster_stats
 from agent_bom.security import sanitize_error
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,92 @@ _SEMANTIC_LAYER_LABELS = {
     GraphSemanticLayer.ASSET.value: "Asset",
     GraphSemanticLayer.INFRA.value: "Infrastructure",
     GraphSemanticLayer.FINDING.value: "Finding",
+}
+
+_EXPOSURE_PATH_OPENAPI_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "Investigation-first exposure path shared by graph views and report exports.",
+    "required": ["id", "label", "summary", "riskScore", "severity", "source", "target", "hops", "relationships"],
+    "properties": {
+        "id": {"type": "string"},
+        "rank": {"type": "integer", "minimum": 1},
+        "label": {"type": "string"},
+        "summary": {"type": "string"},
+        "riskScore": {"type": "number"},
+        "severity": {"type": "string"},
+        "source": {"type": "object", "additionalProperties": True},
+        "target": {"type": "object", "additionalProperties": True},
+        "hops": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "relationships": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "nodeIds": {"type": "array", "items": {"type": "string"}},
+        "edgeIds": {"type": "array", "items": {"type": "string"}},
+        "findings": {"type": "array", "items": {"type": "string"}},
+        "affectedAgents": {"type": "array", "items": {"type": "string"}},
+        "affectedServers": {"type": "array", "items": {"type": "string"}},
+        "reachableTools": {"type": "array", "items": {"type": "string"}},
+        "exposedCredentials": {"type": "array", "items": {"type": "string"}},
+        "dependencyContext": {"type": "object", "additionalProperties": True},
+        "evidence": {"type": "object", "additionalProperties": True},
+        "provenance": {"type": "object", "additionalProperties": True},
+    },
+}
+
+_FIX_FIRST_VIEW_OPENAPI_RESPONSE: dict[str, Any] = {
+    "description": "Fix-first graph view with ranked cards and embedded ExposurePath payloads.",
+    "content": {
+        "application/json": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "scan_id": {"type": "string"},
+                    "tenant_id": {"type": "string"},
+                    "created_at": {"type": "string"},
+                    "cards": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "exposure_path": _EXPOSURE_PATH_OPENAPI_SCHEMA,
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "summary": {"type": "object", "additionalProperties": True},
+                    "focus": {"type": "object", "additionalProperties": True},
+                },
+            }
+        }
+    },
+}
+
+_ATTACK_PATHS_OPENAPI_RESPONSE: dict[str, Any] = {
+    "description": "Ranked attack-path queue with embedded ExposurePath payloads.",
+    "content": {
+        "application/json": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "scan_id": {"type": "string"},
+                    "tenant_id": {"type": "string"},
+                    "created_at": {"type": "string"},
+                    "nodes": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                    "edges": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                    "attack_paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "exposure_path": _EXPOSURE_PATH_OPENAPI_SCHEMA,
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "stats": {"type": "object", "additionalProperties": True},
+                    "pagination": {"type": "object", "additionalProperties": True},
+                },
+            }
+        }
+    },
 }
 
 
@@ -980,7 +1068,7 @@ async def get_graph(
     }
 
 
-@router.get("/v1/graph/views/fix-first", tags=["graph"])
+@router.get("/v1/graph/views/fix-first", tags=["graph"], responses={200: _FIX_FIRST_VIEW_OPENAPI_RESPONSE})
 async def get_fix_first_graph_view(
     request: Request,
     scan_id: Optional[str] = Query(None, description="Scan snapshot ID; latest if omitted"),
@@ -1068,7 +1156,7 @@ async def get_graph_edge_changes(
     return await _graph_store_call(_get_graph_store_or_503().changed_edges_between_scans, old, new, tenant_id=_tenant(request))
 
 
-@router.get("/v1/graph/attack-paths", tags=["graph"])
+@router.get("/v1/graph/attack-paths", tags=["graph"], responses={200: _ATTACK_PATHS_OPENAPI_RESPONSE})
 async def get_graph_attack_paths(
     request: Request,
     scan_id: Optional[str] = Query(None, description="Scan ID"),
@@ -1282,6 +1370,52 @@ async def search_graph(
             "next_cursor": next_cursor or "",
             "has_more": bool(next_cursor) if cursor else offset + limit < total,
         },
+    }
+
+
+@router.get("/v1/graph/clusters", tags=["graph"])
+async def get_graph_clusters(
+    request: Request,
+    scan_id: Optional[str] = Query(None, description="Scan snapshot ID; latest if omitted"),
+    kinds: Optional[str] = Query(None, description="Comma-separated semantic cluster kinds"),
+    min_members: int = Query(2, ge=1, le=100, description="Minimum members required to emit a cluster"),
+    limit: int = Query(250, ge=1, le=1000, description="Maximum clusters to return"),
+) -> dict:
+    """Return API-backed semantic clusters for graph readability.
+
+    The response is intentionally reversible: each cluster carries member IDs
+    and expansion metadata so the dashboard can collapse and expand topology
+    without deriving families client-side.
+    """
+
+    tenant = _tenant(request)
+    graph_store = _get_graph_store_or_503()
+    requested_scan_id = scan_id or ""
+    if not requested_scan_id and not await _graph_store_call(graph_store.latest_snapshot_id, tenant_id=tenant):
+        raise HTTPException(status_code=503, detail="Graph snapshots not found. Run a scan first.")
+
+    selected_kinds = {kind.strip() for kind in kinds.split(",") if kind.strip()} if kinds else set(SEMANTIC_CLUSTER_KINDS)
+    unknown_kinds = selected_kinds - set(SEMANTIC_CLUSTER_KINDS)
+    if unknown_kinds:
+        raise HTTPException(status_code=400, detail=f"Unknown semantic cluster kind(s): {', '.join(sorted(unknown_kinds))}")
+
+    graph = await _graph_store_call(
+        graph_store.load_graph,
+        scan_id=requested_scan_id,
+        tenant_id=tenant,
+    )
+    clusters = [
+        cluster
+        for cluster in build_semantic_clusters(graph.nodes.values(), graph.edges, min_members=min_members)
+        if cluster.kind in selected_kinds
+    ][:limit]
+    return {
+        "scan_id": graph.scan_id,
+        "tenant_id": graph.tenant_id,
+        "created_at": graph.created_at,
+        "clusters": [cluster.to_dict() for cluster in clusters],
+        "stats": semantic_cluster_stats(clusters),
+        "available_kinds": list(SEMANTIC_CLUSTER_KINDS),
     }
 
 
@@ -1509,8 +1643,20 @@ _RELATIONSHIP_SCHEMA_META: dict[str, dict[str, object]] = {
     RelationshipType.HOSTS.value: {
         "category": "inventory",
         "direction": "directed",
-        "source_types": [EntityType.PROVIDER.value, EntityType.ENVIRONMENT.value, EntityType.FLEET.value],
-        "target_types": [EntityType.AGENT.value, EntityType.SERVER.value],
+        "source_types": [
+            EntityType.PROVIDER.value,
+            EntityType.ENVIRONMENT.value,
+            EntityType.FLEET.value,
+            EntityType.ACCOUNT.value,
+            EntityType.CLOUD_RESOURCE.value,
+        ],
+        "target_types": [
+            EntityType.ACCOUNT.value,
+            EntityType.ORG.value,
+            EntityType.AGENT.value,
+            EntityType.SERVER.value,
+            EntityType.CLOUD_RESOURCE.value,
+        ],
         "traversable": True,
     },
     RelationshipType.USES.value: {
@@ -1621,29 +1767,137 @@ _RELATIONSHIP_SCHEMA_META: dict[str, dict[str, object]] = {
     RelationshipType.MANAGES.value: {
         "category": "governance",
         "direction": "directed",
-        "source_types": [EntityType.USER.value, EntityType.GROUP.value, EntityType.SERVICE_ACCOUNT.value],
-        "target_types": [EntityType.AGENT.value, EntityType.FLEET.value, EntityType.ENVIRONMENT.value],
+        "source_types": [
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+        ],
+        "target_types": [EntityType.AGENT.value, EntityType.FLEET.value, EntityType.ENVIRONMENT.value, EntityType.CLOUD_RESOURCE.value],
         "traversable": True,
     },
     RelationshipType.OWNS.value: {
         "category": "governance",
         "direction": "directed",
-        "source_types": [EntityType.USER.value, EntityType.GROUP.value, EntityType.SERVICE_ACCOUNT.value],
+        "source_types": [
+            EntityType.ORG.value,
+            EntityType.ACCOUNT.value,
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+        ],
         "target_types": [EntityType.ENVIRONMENT.value, EntityType.CLOUD_RESOURCE.value, EntityType.AGENT.value],
         "traversable": True,
     },
     RelationshipType.PART_OF.value: {
         "category": "governance",
         "direction": "directed",
-        "source_types": [EntityType.AGENT.value, EntityType.SERVER.value, EntityType.CONTAINER.value],
-        "target_types": [EntityType.FLEET.value, EntityType.CLUSTER.value, EntityType.ENVIRONMENT.value],
+        "source_types": [EntityType.ACCOUNT.value, EntityType.AGENT.value, EntityType.SERVER.value, EntityType.CONTAINER.value],
+        "target_types": [EntityType.ORG.value, EntityType.FLEET.value, EntityType.CLUSTER.value, EntityType.ENVIRONMENT.value],
         "traversable": True,
     },
     RelationshipType.MEMBER_OF.value: {
         "category": "governance",
         "direction": "directed",
-        "source_types": [EntityType.USER.value, EntityType.SERVICE_ACCOUNT.value, EntityType.AGENT.value],
-        "target_types": [EntityType.GROUP.value, EntityType.AGENT.value, EntityType.FLEET.value],
+        "source_types": [
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+            EntityType.AGENT.value,
+        ],
+        "target_types": [EntityType.ACCOUNT.value, EntityType.GROUP.value, EntityType.AGENT.value, EntityType.FLEET.value],
+        "traversable": True,
+    },
+    RelationshipType.ASSUMES.value: {
+        "category": "identity",
+        "direction": "directed",
+        "source_types": [
+            EntityType.USER.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+        ],
+        "target_types": [EntityType.ROLE.value],
+        "traversable": True,
+    },
+    RelationshipType.TRUSTS.value: {
+        "category": "identity",
+        "direction": "directed",
+        "source_types": [EntityType.ROLE.value, EntityType.ACCOUNT.value],
+        "target_types": [
+            EntityType.ACCOUNT.value,
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+        ],
+        "traversable": True,
+    },
+    RelationshipType.ATTACHED.value: {
+        "category": "identity",
+        "direction": "directed",
+        "source_types": [
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+        ],
+        "target_types": [EntityType.POLICY.value],
+        "traversable": True,
+    },
+    RelationshipType.INHERITS.value: {
+        "category": "identity",
+        "direction": "directed",
+        "source_types": [
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+        ],
+        "target_types": [EntityType.POLICY.value, EntityType.ROLE.value],
+        "traversable": True,
+    },
+    RelationshipType.CAN_ACCESS.value: {
+        "category": "identity",
+        "direction": "directed",
+        "source_types": [
+            EntityType.ACCOUNT.value,
+            EntityType.USER.value,
+            EntityType.GROUP.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_ACCOUNT.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+        ],
+        "target_types": [EntityType.CLOUD_RESOURCE.value, EntityType.DATASET.value, EntityType.CREDENTIAL.value],
+        "traversable": True,
+    },
+    RelationshipType.CROSS_ACCOUNT_TRUST.value: {
+        "category": "identity",
+        "direction": "directed",
+        "source_types": [
+            EntityType.ACCOUNT.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+        ],
+        "target_types": [
+            EntityType.ACCOUNT.value,
+            EntityType.ROLE.value,
+            EntityType.SERVICE_PRINCIPAL.value,
+            EntityType.FEDERATED_IDENTITY.value,
+        ],
         "traversable": True,
     },
     RelationshipType.INVOKED.value: {

@@ -18,6 +18,7 @@ from agent_bom.db.graph_store import DEFAULT_GRAPH_TENANT_ID, _init_db, active_e
 from agent_bom.graph import (
     AttackPath,
     EntityType,
+    NodeDimensions,
     RelationshipType,
     UnifiedEdge,
     UnifiedGraph,
@@ -577,6 +578,127 @@ class TestGraphEndpointLogic:
         finally:
             conn.close()
 
+    def test_sqlite_graph_store_read_path_migrates_legacy_edge_history_columns(self, tmp_path):
+        db_path = tmp_path / "legacy-edge-history.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE graph_nodes (
+                    id TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    category_uid INTEGER DEFAULT 0,
+                    class_uid INTEGER DEFAULT 0,
+                    type_uid INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
+                    risk_score REAL DEFAULT 0.0,
+                    severity TEXT DEFAULT '',
+                    severity_id INTEGER DEFAULT 0,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    attributes TEXT DEFAULT '{}',
+                    compliance_tags TEXT DEFAULT '[]',
+                    data_sources TEXT DEFAULT '[]',
+                    dimensions TEXT DEFAULT '{}',
+                    scan_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    PRIMARY KEY (id, scan_id, tenant_id)
+                );
+                CREATE TABLE graph_edges (
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relationship TEXT NOT NULL,
+                    direction TEXT DEFAULT 'directed',
+                    weight REAL DEFAULT 1.0,
+                    traversable INTEGER DEFAULT 1,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    evidence TEXT DEFAULT '{}',
+                    activity_id INTEGER DEFAULT 1,
+                    scan_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    PRIMARY KEY (source_id, target_id, relationship, scan_id, tenant_id)
+                );
+                CREATE TABLE graph_snapshots (
+                    scan_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    created_at TEXT NOT NULL,
+                    node_count INTEGER DEFAULT 0,
+                    edge_count INTEGER DEFAULT 0,
+                    risk_summary TEXT DEFAULT '{}',
+                    PRIMARY KEY (scan_id, tenant_id)
+                );
+                CREATE TABLE attack_paths (
+                    source_node TEXT NOT NULL,
+                    target_node TEXT NOT NULL,
+                    hop_count INTEGER DEFAULT 0,
+                    composite_risk REAL DEFAULT 0.0,
+                    path_nodes TEXT DEFAULT '[]',
+                    path_edges TEXT DEFAULT '[]',
+                    credential_exposure TEXT DEFAULT '[]',
+                    vuln_ids TEXT DEFAULT '[]',
+                    scan_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    computed_at TEXT NOT NULL,
+                    PRIMARY KEY (source_node, target_node, scan_id, tenant_id)
+                );
+                CREATE TABLE interaction_risks (
+                    pattern TEXT NOT NULL,
+                    agents TEXT NOT NULL,
+                    risk_score REAL DEFAULT 0.0,
+                    description TEXT DEFAULT '',
+                    owasp_agentic_tag TEXT DEFAULT NULL,
+                    scan_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    PRIMARY KEY (pattern, agents, scan_id, tenant_id)
+                );
+                CREATE TABLE graph_schema_version (version INTEGER PRIMARY KEY);
+                INSERT INTO graph_schema_version (version) VALUES (2);
+                INSERT INTO graph_nodes (
+                    id, entity_type, label, first_seen, last_seen, scan_id, tenant_id
+                ) VALUES
+                    ('agent:legacy', 'agent', 'Legacy Agent', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', 'legacy-scan', 'default'),
+                    (
+                        'package:legacy', 'package', 'Legacy Package',
+                        '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z',
+                        'legacy-scan', 'default'
+                    );
+                INSERT INTO graph_edges (
+                    source_id, target_id, relationship, first_seen, last_seen, scan_id, tenant_id
+                ) VALUES (
+                    'agent:legacy', 'package:legacy', 'depends_on',
+                    '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', 'legacy-scan', 'default'
+                );
+                INSERT INTO graph_snapshots (
+                    scan_id, tenant_id, created_at, node_count, edge_count
+                ) VALUES ('legacy-scan', 'default', '2026-05-01T00:00:00Z', 2, 1);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = SQLiteGraphStore(db_path)
+
+        assert [snapshot["scan_id"] for snapshot in store.list_snapshots()] == ["legacy-scan"]
+        active_edges = store.active_edges_at("2026-05-02T00:00:00Z")
+
+        assert [(edge["source_id"], edge["target_id"], edge["relationship"]) for edge in active_edges] == [
+            ("agent:legacy", "package:legacy", "depends_on")
+        ]
+        assert active_edges[0]["valid_from"] == "2026-05-01T00:00:00Z"
+
+        conn = sqlite3.connect(db_path)
+        try:
+            edge_columns = {row[1] for row in conn.execute("PRAGMA table_info(graph_edges)").fetchall()}
+            indexes = {row[1] for row in conn.execute("PRAGMA index_list(graph_edges)").fetchall()}
+        finally:
+            conn.close()
+
+        assert {"valid_from", "valid_to", "confidence", "provenance", "source_scan_id", "source_run_id"} <= edge_columns
+        assert "idx_ge_tenant_valid" in indexes
+
     def test_sqlite_graph_store_read_path_does_not_run_legacy_backfill(self, tmp_path, monkeypatch):
         store = SQLiteGraphStore(tmp_path / "read-path-graph.db")
         graph = UnifiedGraph(scan_id="read-scan", tenant_id="tenant-alpha")
@@ -734,6 +856,56 @@ class TestGraphEndpointLogic:
 
         assert reachable == {"server:s", "vuln:cve"}
         assert paths == [["agent:a", "server:s"], ["agent:a", "server:s", "vuln:cve"]]
+
+    def test_sqlite_graph_store_bfs_paths_traverse_persisted_identity_hops(self, tmp_path):
+        from agent_bom.graph.builder import build_unified_graph_from_report
+
+        report = {
+            "scan_id": "identity-hop-scan",
+            "agents": [
+                {
+                    "name": "cloud-agent",
+                    "type": "bedrock",
+                    "status": "configured",
+                    "source": "aws-bedrock",
+                    "metadata": {
+                        "cloud_origin": {
+                            "provider": "aws",
+                            "service": "bedrock",
+                            "resource_type": "agent",
+                            "resource_id": "arn:aws:bedrock:us-east-1:123456789012:agent/agent-abc",
+                            "resource_name": "cloud-agent",
+                            "location": "us-east-1",
+                            "scope": {"account_id": "123456789012"},
+                        },
+                        "cloud_principal": {
+                            "provider": "aws",
+                            "principal_type": "role",
+                            "principal_id": "arn:aws:iam::123456789012:role/AgentRuntimeRole",
+                            "principal_name": "AgentRuntimeRole",
+                        },
+                    },
+                    "mcp_servers": [],
+                }
+            ],
+        }
+        graph = build_unified_graph_from_report(report, tenant_id="default")
+        store = SQLiteGraphStore(tmp_path / "graph.db")
+        store.save_graph(graph)
+
+        account_id = "account:aws:123456789012"
+        resource_id = "cloud_resource:aws:bedrock:agent:arn:aws:bedrock:us-east-1:123456789012:agent/agent-abc"
+        paths, reachable = store.bfs_paths(
+            tenant_id="default",
+            scan_id="identity-hop-scan",
+            source=account_id,
+            max_depth=2,
+        )
+
+        assert resource_id in reachable
+        assert "agent:cloud-agent" in reachable
+        assert [account_id, resource_id] in paths
+        assert [account_id, resource_id, "agent:cloud-agent"] in paths
 
     def test_sqlite_graph_store_impact_of_uses_reverse_edges(self, tmp_path):
         store = SQLiteGraphStore(tmp_path / "graph.db")
@@ -1295,6 +1467,21 @@ def recording_graph_store():
 
 
 class TestGraphStoreBackendSelection:
+    def test_exposure_path_schema_is_documented_in_openapi(self):
+        app.openapi_schema = None
+        schema = TestClient(app).get("/openapi.json").json()
+
+        fix_first_card = schema["paths"]["/v1/graph/views/fix-first"]["get"]["responses"]["200"]["content"]["application/json"]["schema"][
+            "properties"
+        ]["cards"]["items"]
+        attack_path_item = schema["paths"]["/v1/graph/attack-paths"]["get"]["responses"]["200"]["content"]["application/json"]["schema"][
+            "properties"
+        ]["attack_paths"]["items"]
+
+        assert fix_first_card["properties"]["exposure_path"]["required"][:5] == ["id", "label", "summary", "riskScore", "severity"]
+        assert "affectedAgents" in attack_path_item["properties"]["exposure_path"]["properties"]
+        assert "exposedCredentials" in attack_path_item["properties"]["exposure_path"]["properties"]
+
     def test_graph_routes_use_pluggable_store(self, recording_graph_store):
         recording_graph_store.graph.add_node(UnifiedNode(id="vuln:cve", entity_type=EntityType.VULNERABILITY, label="CVE-2026-1"))
         recording_graph_store.graph.attack_paths.append(
@@ -1826,6 +2013,115 @@ class TestGraphStoreBackendSelection:
         }
         assert "source_id" in parameter_names
         assert "source" not in parameter_names
+
+    def test_graph_clusters_return_reversible_semantic_rollups(self, recording_graph_store):
+        recording_graph_store.graph = UnifiedGraph(scan_id="store-scan", tenant_id="default")
+        recording_graph_store.graph.add_node(
+            UnifiedNode(
+                id="agent:a",
+                entity_type=EntityType.AGENT,
+                label="agent-a",
+                data_sources=["fleet-sync"],
+                dimensions=NodeDimensions(agent_type="codex", environment="prod"),
+            )
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(
+                id="agent:b",
+                entity_type=EntityType.AGENT,
+                label="agent-b",
+                data_sources=["fleet-sync"],
+                dimensions=NodeDimensions(agent_type="codex", environment="prod"),
+            )
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(
+                id="server:fs-a",
+                entity_type=EntityType.SERVER,
+                label="mcp-fs-a",
+                dimensions=NodeDimensions(surface="mcp", environment="prod"),
+            )
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(
+                id="server:fs-b",
+                entity_type=EntityType.SERVER,
+                label="mcp-fs-b",
+                dimensions=NodeDimensions(surface="mcp", environment="prod"),
+            )
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(
+                id="pkg:npm:express@4.18.2",
+                entity_type=EntityType.PACKAGE,
+                label="express@4.18.2",
+                severity="high",
+                risk_score=8.1,
+                attributes={"name": "express", "ecosystem": "npm", "version": "4.18.2"},
+                dimensions=NodeDimensions(ecosystem="npm", environment="prod"),
+            )
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(
+                id="pkg:npm:express@4.19.0",
+                entity_type=EntityType.PACKAGE,
+                label="express@4.19.0",
+                severity="critical",
+                risk_score=9.6,
+                attributes={"name": "express", "ecosystem": "npm", "version": "4.19.0"},
+                dimensions=NodeDimensions(ecosystem="npm", environment="prod"),
+            )
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(id="vuln:CVE-2026-1", entity_type=EntityType.VULNERABILITY, label="CVE-2026-1", severity="critical")
+        )
+        recording_graph_store.graph.add_node(
+            UnifiedNode(id="vuln:CVE-2026-2", entity_type=EntityType.VULNERABILITY, label="CVE-2026-2", severity="high")
+        )
+        recording_graph_store.graph.add_edge(UnifiedEdge(source="agent:a", target="server:fs-a", relationship=RelationshipType.USES))
+        recording_graph_store.graph.add_edge(
+            UnifiedEdge(source="server:fs-a", target="pkg:npm:express@4.18.2", relationship=RelationshipType.DEPENDS_ON)
+        )
+        recording_graph_store.graph.add_edge(
+            UnifiedEdge(source="pkg:npm:express@4.18.2", target="vuln:CVE-2026-1", relationship=RelationshipType.VULNERABLE_TO)
+        )
+        client = TestClient(app)
+
+        response = client.get("/v1/graph/clusters", params={"scan_id": "store-scan", "min_members": 2})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["scan_id"] == "store-scan"
+        clusters = {cluster["id"]: cluster for cluster in body["clusters"]}
+        package_cluster = clusters["cluster:package_family:npm-express"]
+        assert package_cluster["kind"] == "package_family"
+        assert package_cluster["label"] == "npm / express"
+        assert package_cluster["count"] == 2
+        assert package_cluster["max_risk"] == 96.0
+        assert package_cluster["severity"] == "critical"
+        assert package_cluster["risk_summary"]["critical"] == 1
+        assert package_cluster["relationship_counts"]["depends_on"] == 1
+        assert package_cluster["relationship_counts"]["vulnerable_to"] == 1
+        assert package_cluster["expansion"] == {
+            "mode": "members",
+            "member_ids": ["pkg:npm:express@4.18.2", "pkg:npm:express@4.19.0"],
+            "collapse_id": "cluster:package_family:npm-express",
+            "reversible": True,
+        }
+        assert clusters["cluster:cve_family:cve-2026"]["member_ids"] == ["vuln:CVE-2026-1", "vuln:CVE-2026-2"]
+        assert clusters["cluster:agent_fleet:codex"]["layer"] == "orchestration"
+        assert body["stats"]["cluster_count"] >= 4
+        assert body["stats"]["package_family_count"] == 1
+        assert "source_environment" in body["available_kinds"]
+        assert any(call[0] == "load_graph" for call in recording_graph_store.calls)
+
+    def test_graph_clusters_reject_unknown_kind(self, recording_graph_store):
+        client = TestClient(app)
+
+        response = client.get("/v1/graph/clusters", params={"kinds": "package_family,nope"})
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Unknown semantic cluster kind(s): nope"
 
     def test_graph_impact_uses_store_native_traversal(self, recording_graph_store):
         recording_graph_store.graph = UnifiedGraph(scan_id="store-scan", tenant_id="default")

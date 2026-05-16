@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   Background,
@@ -89,14 +90,27 @@ import { buildUnifiedFlowGraph } from "@/lib/unified-graph-flow";
 import {
   LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD,
   LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD,
-  shouldUseLargeGraphOverview,
 } from "@/lib/large-graph-overview";
+import { decideGraphRenderer } from "@/lib/graph-renderer-switch";
 import {
   applyFilters,
   decodeFiltersFromParams,
   encodeFiltersToParams,
 } from "@/lib/filter-algebra";
 import { useCaptureMode } from "@/lib/use-capture-mode";
+
+const SigmaGraphOverview = dynamic(
+  () => import("@/components/sigma-graph-overview").then((mod) => mod.SigmaGraphOverview),
+  {
+    ssr: false,
+    loading: () => (
+      <GraphPanelSkeleton
+        title="Loading WebGL graph"
+        detail="Preparing the Sigma renderer for the broad graph overview."
+      />
+    ),
+  },
+);
 
 function PulseStyles() {
   return (
@@ -1063,13 +1077,16 @@ function GraphPageInner() {
   );
 
   const graphOnlyFindings = displayNodes.length > 0 && !hasContextualGraph;
-  const useLargeGraphOverview = shouldUseLargeGraphOverview({
+  const webglGraphEnabled =
+    searchParams?.get("renderer") === "webgl" || searchParams?.get("webgl") === "1";
+  const graphRenderer = decideGraphRenderer({
     nodeCount: displayNodes.length,
     edgeCount: displayEdges.length,
     captureMode,
     selectedAttackPath: Boolean(selectedAttackPath),
     reachabilityActive: Boolean(reachabilitySummary),
     graphOnlyFindings,
+    webglEnabled: webglGraphEnabled,
   });
   const graphPanelError = error && snapshots.length > 0 ? graphErrorState(error) : null;
   const findingNodes = useMemo(
@@ -1796,8 +1813,15 @@ function GraphPageInner() {
                 setFilters(createExpandedGraphFilters(filters.agentName ?? flow.agentNames[0] ?? null))
               }
             />
-          ) : useLargeGraphOverview ? (
+          ) : graphRenderer.kind === "large-overview" ? (
             <LargeGraphOverview
+              nodes={displayNodes}
+              edges={displayEdges}
+              legendItems={legendItems}
+              onNodeSelect={onLargeGraphNodeSelect}
+            />
+          ) : graphRenderer.kind === "webgl" ? (
+            <SigmaGraphOverview
               nodes={displayNodes}
               edges={displayEdges}
               legendItems={legendItems}

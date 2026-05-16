@@ -16,6 +16,7 @@ from agent_bom.asset_provenance import (
 from agent_bom.evidence import EvidenceTier, redact_for_persistence
 from agent_bom.finding import FindingType
 from agent_bom.models import AIBOMReport, Severity
+from agent_bom.output.exposure_path import exposure_path_for_blast_radius
 from agent_bom.security import sanitize_sensitive_payload
 
 _SARIF_SEVERITY_MAP = {
@@ -109,6 +110,19 @@ def _sanitize_sarif_text(field_name: str, value: Any, *, fallback: str = "") -> 
     return str(redacted)
 
 
+def _trust_assessment_sarif_property(data: dict[str, Any]) -> dict[str, str]:
+    """Project safe dual-axis trust fields into SARIF run properties."""
+    allowed_fields = (
+        "verdict",
+        "content_verdict",
+        "provenance_verdict",
+        "review_verdict",
+        "overall_recommendation",
+        "confidence",
+    )
+    return {field: str(data[field]) for field in allowed_fields if data.get(field) is not None}
+
+
 def _build_run_taxonomies(results: list[dict]) -> list[dict]:
     """Build SARIF run-level taxonomies from per-result framework tags."""
     tags_by_property: dict[str, set[str]] = {key: set() for key in _FRAMEWORK_TAXONOMY_META}
@@ -173,7 +187,7 @@ def to_sarif(report: AIBOMReport, *, exclude_unfixable: bool = False) -> dict:
     results = []
     seen_rule_ids: set[str] = set()
 
-    for br in report.blast_radii:
+    for rank, br in enumerate(report.blast_radii, 1):
         vuln = br.vulnerability
         rule_id = vuln.id
 
@@ -255,6 +269,7 @@ def to_sarif(report: AIBOMReport, *, exclude_unfixable: bool = False) -> dict:
         # a compliance tag to trigger enrichment.
         result_properties: dict = {
             "blast_score": br.risk_score,
+            "exposure_path": exposure_path_for_blast_radius(br, rank=rank),
             "epss_score": vuln.epss_score,
             "is_kev": vuln.is_kev,
             "exploit_likelihood": vuln.exploit_likelihood,
@@ -622,6 +637,11 @@ def to_sarif(report: AIBOMReport, *, exclude_unfixable: bool = False) -> dict:
         "results": results,
         **({"automationDetails": {"id": f"agent-bom/{report.scan_id}"}} if report.scan_id else {}),
     }
+    trust_assessment = getattr(report, "trust_assessment_data", None)
+    if isinstance(trust_assessment, dict) and trust_assessment:
+        run["properties"] = {
+            "trust_assessment": _trust_assessment_sarif_property(trust_assessment),
+        }
     if taxonomies:
         run["taxonomies"] = taxonomies
 

@@ -48,6 +48,13 @@ class Verdict(str, Enum):
     MALICIOUS = "malicious"
 
 
+class ProvenanceVerdict(str, Enum):
+    """Provenance/signing verification verdict."""
+
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+
+
 class ReviewVerdict(str, Enum):
     """Review-focused skill handling verdict."""
 
@@ -93,18 +100,20 @@ class TrustAssessmentResult:
 
     The result now carries TWO axes:
 
-    - `provenance_verdict` -- signed, install metadata complete, source URL?
+    - `provenance_verdict` -- verified source/signing posture or unverified?
     - `content_verdict`    -- behavioural risk signals from the audit?
 
-    `verdict` (the union of both) and `review_verdict` are preserved so
-    pre-#2197 consumers don't break.
+    `verdict` is preserved for pre-#2197 consumers as a derived content
+    verdict for one compatibility release. Use `review_verdict` or
+    `overall_recommendation` for handling decisions because provenance-only
+    gaps should send a skill to review without implying malicious content.
     """
 
     categories: list[TrustCategoryResult] = field(default_factory=list)
     verdict: Verdict = Verdict.BENIGN
     review_verdict: ReviewVerdict = ReviewVerdict.REVIEW
     confidence: Confidence = Confidence.LOW
-    provenance_verdict: Verdict = Verdict.BENIGN
+    provenance_verdict: ProvenanceVerdict = ProvenanceVerdict.VERIFIED
     content_verdict: Verdict = Verdict.BENIGN
     recommendations: list[str] = field(default_factory=list)
     review_reasons: list[str] = field(default_factory=list)
@@ -128,6 +137,7 @@ class TrustAssessmentResult:
             "source_file": self.source_file,
             "verdict": self.verdict.value,
             "review_verdict": self.review_verdict.value,
+            "overall_recommendation": self.review_verdict.value,
             "confidence": self.confidence.value,
             # Two-axis split (#2197 audit). `verdict` above is kept for
             # backward compat; new consumers should prefer these axes.
@@ -657,6 +667,40 @@ def _compute_axis_verdict(categories: list[TrustCategoryResult]) -> Verdict:
     return Verdict.BENIGN
 
 
+def _compute_content_verdict_from_audit(audit: SkillAuditResult) -> Verdict:
+    """Compute behavioral content risk without metadata/provenance signals.
+
+    Severity ladder:
+    - behavioral + critical -> malicious
+    - behavioral + high     -> suspicious
+    - behavioral + medium   -> benign content, review via review_verdict
+    - behavioral + low      -> benign content
+    - metadata/catalog only -> benign content; provenance/review axes handle it
+    """
+    findings = audit.findings
+    if any(f.category in _BLOCKED_FINDING_CATEGORIES for f in findings):
+        return Verdict.MALICIOUS
+    if any(f.severity == "critical" and _is_behavioral_content_finding(f.category) for f in findings):
+        return Verdict.MALICIOUS
+    if any(f.category in _HIGH_RISK_FINDING_CATEGORIES for f in findings):
+        return Verdict.SUSPICIOUS
+    if any(f.severity == "high" and _is_behavioral_content_finding(f.category) for f in findings):
+        return Verdict.SUSPICIOUS
+    return Verdict.BENIGN
+
+
+def _compute_provenance_verdict(provenance_categories: list[TrustCategoryResult]) -> ProvenanceVerdict:
+    """Compute whether provenance metadata is complete enough to be treated as verified."""
+    if _compute_axis_verdict(provenance_categories) == Verdict.BENIGN:
+        return ProvenanceVerdict.VERIFIED
+    return ProvenanceVerdict.UNVERIFIED
+
+
+def _combine_verdict(provenance_verdict: ProvenanceVerdict, content_verdict: Verdict) -> Verdict:
+    """Return legacy `verdict` as content verdict for one compatibility release."""
+    return content_verdict
+
+
 # ── Recommendations ──────────────────────────────────────────────────────────
 
 
@@ -726,19 +770,42 @@ _HIGH_RISK_FINDING_CATEGORIES = {
     "agent_delegation",
 }
 
+_REVIEW_ONLY_FINDING_CATEGORIES = {
+    "missing_capability_declaration",
+    "undeclared_dependency",
+    "undocumented_network",
+    "unknown_package",
+    "unverified_server",
+}
+
+
+def _is_behavioral_content_finding(category: str) -> bool:
+    """Return whether an audit finding describes skill behavior."""
+    return category not in _REVIEW_ONLY_FINDING_CATEGORIES
+
 
 def _compute_review_verdict(
-    verdict: Verdict,
+    provenance_verdict: ProvenanceVerdict,
+    content_verdict: Verdict,
     categories: list[TrustCategoryResult],
     audit: SkillAuditResult,
 ) -> ReviewVerdict:
     """Map trust and audit signals to a handling-oriented review verdict."""
     findings = audit.findings
-    if any(f.category in _BLOCKED_FINDING_CATEGORIES or f.severity == "critical" for f in findings):
+    if any(
+        f.category in _BLOCKED_FINDING_CATEGORIES or (f.severity == "critical" and _is_behavioral_content_finding(f.category))
+        for f in findings
+    ):
         return ReviewVerdict.BLOCKED
-    if verdict == Verdict.MALICIOUS or any(f.category in _HIGH_RISK_FINDING_CATEGORIES for f in findings):
+    if content_verdict == Verdict.MALICIOUS or any(f.category in _HIGH_RISK_FINDING_CATEGORIES for f in findings):
         return ReviewVerdict.HIGH_RISK
-    if verdict == Verdict.SUSPICIOUS or any(c.level in {TrustLevel.WARN, TrustLevel.FAIL} for c in categories):
+    if any(f.severity == "medium" and _is_behavioral_content_finding(f.category) for f in findings):
+        return ReviewVerdict.REVIEW
+    if (
+        content_verdict == Verdict.SUSPICIOUS
+        or provenance_verdict == ProvenanceVerdict.UNVERIFIED
+        or any(c.level in {TrustLevel.WARN, TrustLevel.FAIL} for c in categories)
+    ):
         return ReviewVerdict.REVIEW
     return ReviewVerdict.TRUSTED
 
@@ -806,14 +873,15 @@ def assess_trust(
         _assess_persistence_privilege(meta, scan, audit),
     ]
 
-    verdict, confidence = _compute_verdict(categories)
+    _legacy_verdict, confidence = _compute_verdict(categories)
     # Per #2197 audit: split verdict into provenance + content so a clean
     # skill that's just unsigned no longer reads as `malicious`.
-    provenance_categories, content_categories = _split_categories(categories)
-    provenance_verdict = _compute_axis_verdict(provenance_categories)
-    content_verdict = _compute_axis_verdict(content_categories)
+    provenance_categories, _content_categories = _split_categories(categories)
+    provenance_verdict = _compute_provenance_verdict(provenance_categories)
+    content_verdict = _compute_content_verdict_from_audit(audit)
+    verdict = _combine_verdict(provenance_verdict, content_verdict)
     recommendations = _generate_recommendations(categories)
-    review_verdict = _compute_review_verdict(verdict, categories, audit)
+    review_verdict = _compute_review_verdict(provenance_verdict, content_verdict, categories, audit)
     review_reasons = _build_review_reasons(categories, audit)
     reviewer_guidance = _build_reviewer_guidance(audit)
 

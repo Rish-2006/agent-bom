@@ -17,7 +17,7 @@ from agent_bom.asset_provenance import package_version_provenance, sanitize_disc
 from agent_bom.canonical_ids import canonical_agent_id, canonical_graph_node_id, source_ids
 from agent_bom.graph.container import UnifiedGraph
 from agent_bom.graph.edge import UnifiedEdge
-from agent_bom.graph.node import NodeDimensions, UnifiedNode
+from agent_bom.graph.node import NodeDimensions, UnifiedNode, stable_node_id
 from agent_bom.graph.severity import SEVERITY_RISK_SCORE
 from agent_bom.graph.types import EntityType, RelationshipType
 from agent_bom.mcp_blocklist import sanitize_security_intelligence_entry
@@ -822,17 +822,35 @@ def build_unified_graph_from_report(
     toxic_data = report_json.get("toxic_combinations")
     if toxic_data:
         for combo in toxic_data if isinstance(toxic_data, list) else toxic_data.get("combinations", []):
-            combo_vulns = combo.get("vulnerability_ids", combo.get("vulns", []))
-            combo_label = combo.get("name", combo.get("label", "toxic_combo"))
-            toxic_node_id = f"toxic:{combo_label}"
+            components = combo.get("components", []) if isinstance(combo.get("components", []), list) else []
+            component_vulns = [
+                str(component.get("id", "")).strip()
+                for component in components
+                if str(component.get("type", "")).lower() in {"cve", "vulnerability"} and str(component.get("id", "")).strip()
+            ]
+            combo_vulns = combo.get("vulnerability_ids", combo.get("vulns", component_vulns))
+            if not isinstance(combo_vulns, list):
+                combo_vulns = [combo_vulns]
+            combo_vulns = [str(vuln_id).strip() for vuln_id in combo_vulns if str(vuln_id).strip()]
+            combo_label = combo.get("label") or combo.get("title") or combo.get("name") or combo.get("pattern") or "toxic_combo"
+            combo_key = combo.get("id") or combo.get("name") or combo.get("label")
+            if not combo_key:
+                combo_key = stable_node_id("toxic-combination", str(combo.get("pattern", "")), str(combo_label))[:12]
+            toxic_node_id = f"toxic:{combo_key}"
             graph.add_node(
                 UnifiedNode(
                     id=toxic_node_id,
                     entity_type=EntityType.MISCONFIGURATION,
                     label=combo_label,
+                    severity=str(combo.get("severity", "") or ""),
                     risk_score=float(combo.get("risk_score", 0) or 0),
                     attributes={
-                        "combo": combo_label,
+                        "combo": combo_key,
+                        "pattern": combo.get("pattern", ""),
+                        "title": combo.get("title", combo_label),
+                        "description": combo.get("description", ""),
+                        "components": components,
+                        "remediation": combo.get("remediation", ""),
                         "risk_score": combo.get("risk_score", 0),
                         "vulnerability_ids": combo_vulns,
                     },
@@ -847,7 +865,13 @@ def build_unified_graph_from_report(
                             source=vuln_node_id,
                             target=toxic_node_id,
                             relationship=RelationshipType.TRIGGERS,
-                            evidence={"combo": combo_label, "risk": combo.get("risk_score", 0)},
+                            evidence={
+                                "combo": combo_key,
+                                "pattern": combo.get("pattern", ""),
+                                "title": combo.get("title", combo_label),
+                                "risk": combo.get("risk_score", 0),
+                                "remediation": combo.get("remediation", ""),
+                            },
                         )
                     )
 
@@ -1242,6 +1266,102 @@ def _collect_compliance_tags(br_dict: dict[str, Any]) -> list[str]:
     return sorted(set(tags))
 
 
+_PRINCIPAL_TYPE_TO_ENTITY: dict[str, EntityType] = {
+    "account": EntityType.ACCOUNT,
+    "aws-account": EntityType.ACCOUNT,
+    "cloud-account": EntityType.ACCOUNT,
+    "federated": EntityType.FEDERATED_IDENTITY,
+    "federated-identity": EntityType.FEDERATED_IDENTITY,
+    "federated-user": EntityType.FEDERATED_IDENTITY,
+    "group": EntityType.GROUP,
+    "iam-role": EntityType.ROLE,
+    "oidc": EntityType.FEDERATED_IDENTITY,
+    "policy": EntityType.POLICY,
+    "role": EntityType.ROLE,
+    "saml": EntityType.FEDERATED_IDENTITY,
+    "service-account": EntityType.SERVICE_ACCOUNT,
+    "service-principal": EntityType.SERVICE_PRINCIPAL,
+    "serviceprincipal": EntityType.SERVICE_PRINCIPAL,
+    "user": EntityType.USER,
+}
+
+_IDENTITY_NODE_PREFIX: dict[EntityType, str] = {
+    EntityType.ORG: "org",
+    EntityType.ACCOUNT: "account",
+    EntityType.USER: "user",
+    EntityType.GROUP: "group",
+    EntityType.ROLE: "role",
+    EntityType.POLICY: "policy",
+    EntityType.SERVICE_ACCOUNT: "service_account",
+    EntityType.SERVICE_PRINCIPAL: "service_principal",
+    EntityType.FEDERATED_IDENTITY: "federated_identity",
+}
+
+
+def _identity_entity_type(raw_type: Any) -> EntityType:
+    principal_type = _clean_graph_part(raw_type).lower().replace("_", "-").replace(" ", "-")
+    return _PRINCIPAL_TYPE_TO_ENTITY.get(principal_type, EntityType.SERVICE_ACCOUNT)
+
+
+def _identity_node_id(entity_type: EntityType, provider: str, identity_id: str) -> str:
+    prefix = _IDENTITY_NODE_PREFIX.get(entity_type, "identity")
+    return f"{prefix}:{provider}:{identity_id}"
+
+
+def _first_cloud_scope_value(scope: dict[str, Any], *keys: str) -> tuple[str, str]:
+    for key in keys:
+        value = _clean_graph_part(scope.get(key))
+        if value:
+            return key, value
+    return "", ""
+
+
+def _policy_entries(principal: dict[str, Any]) -> list[dict[str, str]]:
+    raw_policies = principal.get("policies") or principal.get("attached_policies") or principal.get("policy_ids") or []
+    if isinstance(raw_policies, (str, bytes)):
+        raw_policies = [raw_policies]
+    if not isinstance(raw_policies, list):
+        return []
+
+    policies: list[dict[str, str]] = []
+    for raw_policy in raw_policies:
+        if isinstance(raw_policy, dict):
+            policy_id = _clean_graph_part(raw_policy.get("policy_id")) or _clean_graph_part(raw_policy.get("arn"))
+            policy_name = _clean_graph_part(raw_policy.get("policy_name")) or _clean_graph_part(raw_policy.get("name")) or policy_id
+        else:
+            policy_id = _clean_graph_part(raw_policy)
+            policy_name = policy_id
+        if policy_id:
+            policies.append({"id": policy_id, "name": policy_name or policy_id})
+    return policies
+
+
+def _trust_entries(principal: dict[str, Any]) -> list[dict[str, str]]:
+    raw_trusts = principal.get("trust_principals") or []
+    if isinstance(raw_trusts, dict):
+        raw_trusts = [raw_trusts]
+    if not isinstance(raw_trusts, list):
+        return []
+
+    trusts: list[dict[str, str]] = []
+    for raw_trust in raw_trusts:
+        if not isinstance(raw_trust, dict):
+            continue
+        principal_id = _clean_graph_part(raw_trust.get("principal_id")) or _clean_graph_part(raw_trust.get("arn"))
+        if not principal_id:
+            continue
+        trusts.append(
+            {
+                "id": principal_id,
+                "name": _clean_graph_part(raw_trust.get("principal_name")) or principal_id,
+                "type": _clean_graph_part(raw_trust.get("principal_type")) or "federated-identity",
+                "relationship": _clean_graph_part(raw_trust.get("relationship")) or "trusts",
+                "source_field": _clean_graph_part(raw_trust.get("source_field")),
+            }
+        )
+    return trusts
+
+
 def _add_agent_cloud_lineage(
     graph: UnifiedGraph,
     *,
@@ -1282,6 +1402,21 @@ def _add_agent_cloud_lineage(
     cloud_provider_id = f"provider:{provider}"
     resource_node_id = f"cloud_resource:{provider}:{service}:{resource_type}:{resource_id}"
     data_sources = sorted({data_source, str(agent_dict.get("source") or "").strip(), f"cloud:{provider}"} - {""})
+    scope = origin.get("scope", {})
+    if not isinstance(scope, dict):
+        scope = {}
+    org_key, org_id = _first_cloud_scope_value(scope, "org_id", "organization_id", "management_group_id")
+    account_key, account_id = _first_cloud_scope_value(
+        scope,
+        "account_id",
+        "aws_account_id",
+        "subscription_id",
+        "project_id",
+        "tenant_id",
+    )
+    account_id = account_id or _clean_graph_part(origin.get("account_id")) or _clean_graph_part(origin.get("subscription_id"))
+    org_node_id = _identity_node_id(EntityType.ORG, provider, org_id) if org_id else ""
+    account_node_id = _identity_node_id(EntityType.ACCOUNT, provider, account_id) if account_id else ""
 
     graph.add_node(
         UnifiedNode(
@@ -1314,6 +1449,71 @@ def _add_agent_cloud_lineage(
             dimensions=NodeDimensions(cloud_provider=provider, surface=service),
         )
     )
+    if org_node_id:
+        graph.add_node(
+            UnifiedNode(
+                id=org_node_id,
+                entity_type=EntityType.ORG,
+                label=org_id,
+                attributes={
+                    "org_id": org_id,
+                    "scope_key": org_key,
+                    "cloud_provider": provider,
+                    "cloud_origin": origin,
+                },
+                data_sources=data_sources,
+                dimensions=NodeDimensions(cloud_provider=provider, surface="identity"),
+            )
+        )
+        graph.add_edge(
+            UnifiedEdge(
+                source=cloud_provider_id,
+                target=org_node_id,
+                relationship=RelationshipType.HOSTS,
+                evidence={"source": "cloud_origin", "provider": provider, "scope_key": org_key},
+            )
+        )
+    if account_node_id:
+        graph.add_node(
+            UnifiedNode(
+                id=account_node_id,
+                entity_type=EntityType.ACCOUNT,
+                label=account_id,
+                attributes={
+                    "account_id": account_id,
+                    "scope_key": account_key or "account_id",
+                    "cloud_provider": provider,
+                    "cloud_origin": origin,
+                },
+                data_sources=data_sources,
+                dimensions=NodeDimensions(cloud_provider=provider, surface="identity"),
+            )
+        )
+        graph.add_edge(
+            UnifiedEdge(
+                source=cloud_provider_id,
+                target=account_node_id,
+                relationship=RelationshipType.HOSTS,
+                evidence={"source": "cloud_origin", "provider": provider, "scope_key": account_key or "account_id"},
+            )
+        )
+        if org_node_id:
+            graph.add_edge(
+                UnifiedEdge(
+                    source=account_node_id,
+                    target=org_node_id,
+                    relationship=RelationshipType.PART_OF,
+                    evidence={"source": "cloud_origin", "provider": provider, "scope_key": org_key},
+                )
+            )
+        graph.add_edge(
+            UnifiedEdge(
+                source=account_node_id,
+                target=resource_node_id,
+                relationship=RelationshipType.HOSTS,
+                evidence={"source": "cloud_origin", "provider": provider, "scope_key": account_key or "account_id"},
+            )
+        )
     graph.add_edge(
         UnifiedEdge(
             source=cloud_provider_id,
@@ -1338,16 +1538,18 @@ def _add_agent_cloud_lineage(
     if not principal_id:
         return
     principal_name = _clean_graph_part(principal.get("principal_name")) or principal_id
-    principal_node_id = f"service_account:{provider}:{principal_id}"
+    principal_type = principal.get("principal_type", "")
+    principal_entity_type = _identity_entity_type(principal_type)
+    principal_node_id = _identity_node_id(principal_entity_type, provider, principal_id)
     graph.add_node(
         UnifiedNode(
             id=principal_node_id,
-            entity_type=EntityType.SERVICE_ACCOUNT,
+            entity_type=principal_entity_type,
             label=principal_name,
             attributes={
                 "principal_id": principal_id,
                 "principal_name": principal_name,
-                "principal_type": principal.get("principal_type", ""),
+                "principal_type": principal_type,
                 "tenant_id": principal.get("tenant_id", ""),
                 "source_field": principal.get("source_field", ""),
                 "cloud_provider": provider,
@@ -1358,14 +1560,87 @@ def _add_agent_cloud_lineage(
             dimensions=NodeDimensions(cloud_provider=provider, surface="identity"),
         )
     )
+    if account_node_id:
+        graph.add_edge(
+            UnifiedEdge(
+                source=principal_node_id,
+                target=account_node_id,
+                relationship=RelationshipType.MEMBER_OF,
+                evidence={"source": "cloud_principal", "principal_type": principal_type},
+            )
+        )
     graph.add_edge(
         UnifiedEdge(
             source=principal_node_id,
             target=resource_node_id,
             relationship=RelationshipType.MANAGES,
-            evidence={"source": "cloud_principal", "principal_type": principal.get("principal_type", "")},
+            evidence={"source": "cloud_principal", "principal_type": principal_type},
         )
     )
+    graph.add_edge(
+        UnifiedEdge(
+            source=principal_node_id,
+            target=resource_node_id,
+            relationship=RelationshipType.CAN_ACCESS,
+            evidence={"source": "cloud_principal", "principal_type": principal_type},
+        )
+    )
+    for policy in _policy_entries(principal):
+        policy_node_id = _identity_node_id(EntityType.POLICY, provider, policy["id"])
+        graph.add_node(
+            UnifiedNode(
+                id=policy_node_id,
+                entity_type=EntityType.POLICY,
+                label=policy["name"],
+                attributes={"policy_id": policy["id"], "policy_name": policy["name"], "cloud_provider": provider},
+                data_sources=data_sources,
+                dimensions=NodeDimensions(cloud_provider=provider, surface="identity"),
+            )
+        )
+        graph.add_edge(
+            UnifiedEdge(
+                source=principal_node_id,
+                target=policy_node_id,
+                relationship=RelationshipType.ATTACHED,
+                evidence={"source": "cloud_principal", "principal_type": principal_type},
+            )
+        )
+    for trust in _trust_entries(principal):
+        trust_entity_type = _identity_entity_type(trust["type"])
+        trust_node_id = _identity_node_id(trust_entity_type, provider, trust["id"])
+        graph.add_node(
+            UnifiedNode(
+                id=trust_node_id,
+                entity_type=trust_entity_type,
+                label=trust["name"],
+                attributes={
+                    "principal_id": trust["id"],
+                    "principal_name": trust["name"],
+                    "principal_type": trust["type"],
+                    "cloud_provider": provider,
+                },
+                data_sources=data_sources,
+                dimensions=NodeDimensions(cloud_provider=provider, surface="identity"),
+            )
+        )
+        relationship = (
+            RelationshipType.CROSS_ACCOUNT_TRUST
+            if trust["relationship"] == RelationshipType.CROSS_ACCOUNT_TRUST.value
+            else RelationshipType.TRUSTS
+        )
+        graph.add_edge(
+            UnifiedEdge(
+                source=principal_node_id,
+                target=trust_node_id,
+                relationship=relationship,
+                evidence={
+                    "source": "cloud_principal_trust",
+                    "principal_type": principal_type,
+                    "trusted_principal_type": trust["type"],
+                    "source_field": trust["source_field"],
+                },
+            )
+        )
     # Direct principal → agent edge so single-hop "which principals can
     # reach this agent?" queries don't have to traverse the intermediate
     # cloud_resource node. The intermediate edges (principal → resource,
@@ -1380,7 +1655,7 @@ def _add_agent_cloud_lineage(
             relationship=RelationshipType.MANAGES,
             evidence={
                 "source": "cloud_principal",
-                "principal_type": principal.get("principal_type", ""),
+                "principal_type": principal_type,
                 "via": resource_node_id,
             },
         )

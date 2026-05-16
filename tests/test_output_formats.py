@@ -25,6 +25,7 @@ from agent_bom.models import (
 )
 from agent_bom.output import to_csv, to_json, to_junit, to_markdown, to_spdx
 from agent_bom.output.html import to_html
+from agent_bom.output.sarif import to_sarif
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -529,6 +530,141 @@ class TestMarkdown:
         assert "nvd:cvss_v3" in md
         assert "- **EPSS percentile**: 99.1234" in md
         assert "- **KEV date added**: 2026-01-15" in md
+
+    def test_exposure_paths_render_in_markdown(self):
+        tool = MCPTool(name="deploy", description="Deploy workloads")
+        server = _make_server(name="prod-mcp", tools=[tool], env={"AWS_SECRET_ACCESS_KEY": "redacted"})
+        agent = _make_agent(name="prod-agent", servers=[server])
+        br = _make_blast_radius(agents=[agent])
+        br.affected_servers = [server]
+        br.exposed_tools = [tool]
+        br.exposed_credentials = ["AWS_SECRET_ACCESS_KEY"]
+        br.risk_score = 9.4
+        report = _make_report(agents=[agent], blast_radii=[br])
+
+        md = to_markdown(report, [br])
+
+        assert "## Exposure Paths" in md
+        assert "| #1 | 9.4 | CRITICAL | lodash@4.17.20 -> CVE-2024-0001 |" in md
+        assert "1 affected agent(s), 1 affected server(s), 1 reachable tool(s), 1 exposed credential reference(s)" in md
+        assert "Upgrade lodash to 4.17.21" in md
+
+    def test_skill_trust_axes_render_in_markdown(self):
+        report = _make_report()
+        report.trust_assessment_data = {
+            "skill_name": "scan",
+            "source_file": "SKILL.md",
+            "verdict": "benign",
+            "content_verdict": "benign",
+            "provenance_verdict": "unverified",
+            "review_verdict": "review",
+            "overall_recommendation": "review",
+            "confidence": "medium",
+            "categories": [],
+            "recommendations": [],
+        }
+
+        md = to_markdown(report)
+
+        assert "## Skill Trust Assessment" in md
+        assert "| Content verdict | `benign` |" in md
+        assert "| Provenance verdict | `unverified` |" in md
+        assert "| Recommendation | `review` |" in md
+
+
+def test_exposure_path_is_embedded_in_sarif_properties():
+    tool = MCPTool(name="deploy", description="Deploy workloads")
+    server = _make_server(name="prod-mcp", tools=[tool], env={"AWS_SECRET_ACCESS_KEY": "redacted"})
+    agent = _make_agent(name="prod-agent", servers=[server])
+    br = _make_blast_radius(agents=[agent])
+    br.affected_servers = [server]
+    br.exposed_tools = [tool]
+    br.exposed_credentials = ["AWS_SECRET_ACCESS_KEY"]
+    br.risk_score = 9.4
+    report = _make_report(agents=[agent], blast_radii=[br])
+
+    sarif = to_sarif(report)
+    exposure_path = sarif["runs"][0]["results"][0]["properties"]["exposure_path"]
+
+    assert exposure_path["label"] == "lodash@4.17.20 -> CVE-2024-0001"
+    assert exposure_path["affectedAgents"] == ["prod-agent"]
+    assert exposure_path["affectedServers"] == ["prod-mcp"]
+    assert exposure_path["reachableTools"] == ["deploy"]
+    assert exposure_path["exposedCredentials"] == ["AWS_SECRET_ACCESS_KEY"]
+    assert {
+        "id": "agent:prod-agent->uses->server:prod-mcp",
+        "type": "uses",
+        "source": "agent:prod-agent",
+        "target": "server:prod-mcp",
+    } in exposure_path["relationships"]
+
+
+def test_exposure_path_is_embedded_in_json_report():
+    tool = MCPTool(name="deploy", description="Deploy workloads")
+    server = _make_server(name="prod-mcp", tools=[tool], env={"AWS_SECRET_ACCESS_KEY": "redacted"})
+    agent = _make_agent(name="prod-agent", servers=[server])
+    br = _make_blast_radius(agents=[agent])
+    br.affected_servers = [server]
+    br.exposed_tools = [tool]
+    br.exposed_credentials = ["AWS_SECRET_ACCESS_KEY"]
+    br.risk_score = 9.4
+    report = _make_report(agents=[agent], blast_radii=[br])
+
+    payload = to_json(report)
+    exposure_path = payload["exposure_paths"]["paths"][0]
+
+    assert payload["exposure_paths"]["schema_version"] == "1"
+    assert payload["exposure_paths"]["path_count"] == 1
+    assert payload["blast_radius"][0]["exposure_path"] == exposure_path
+    assert exposure_path["label"] == "lodash@4.17.20 -> CVE-2024-0001"
+    assert exposure_path["affectedAgents"] == ["prod-agent"]
+    assert exposure_path["affectedServers"] == ["prod-mcp"]
+    assert exposure_path["reachableTools"] == ["deploy"]
+    assert exposure_path["exposedCredentials"] == ["AWS_SECRET_ACCESS_KEY"]
+
+
+def test_skill_trust_axes_are_embedded_in_sarif_properties():
+    report = _make_report()
+    report.trust_assessment_data = {
+        "skill_name": "scan",
+        "source_file": "SKILL.md",
+        "verdict": "benign",
+        "content_verdict": "benign",
+        "provenance_verdict": "unverified",
+        "review_verdict": "review",
+        "overall_recommendation": "review",
+        "confidence": "medium",
+        "categories": [],
+        "recommendations": [],
+    }
+
+    sarif = to_sarif(report)
+    trust = sarif["runs"][0]["properties"]["trust_assessment"]
+
+    assert trust["verdict"] == "benign"
+    assert trust["content_verdict"] == "benign"
+    assert trust["provenance_verdict"] == "unverified"
+    assert trust["overall_recommendation"] == "review"
+
+
+def test_html_renders_exposure_path_investigation_briefs():
+    tool = MCPTool(name="deploy", description="Deploy workloads")
+    server = _make_server(name="prod-mcp", tools=[tool], env={"AWS_SECRET_ACCESS_KEY": "redacted"})
+    agent = _make_agent(name="prod-agent", servers=[server])
+    br = _make_blast_radius(agents=[agent])
+    br.affected_servers = [server]
+    br.exposed_tools = [tool]
+    br.exposed_credentials = ["AWS_SECRET_ACCESS_KEY"]
+    br.risk_score = 9.4
+    report = _make_report(agents=[agent], blast_radii=[br])
+
+    html = to_html(report, [br])
+
+    assert 'id="exposure-paths"' in html
+    assert "Exposure Paths" in html
+    assert "lodash@4.17.20 -&gt; CVE-2024-0001" in html
+    assert "1 affected agent(s), 1 affected server(s), 1 reachable tool(s), 1 exposed credential reference(s)" in html
+    assert "Upgrade lodash to 4.17.21" in html
 
 
 def test_spdx_vulnerability_annotations_preserve_enrichment_and_compliance_metadata():

@@ -1094,6 +1094,11 @@ def test_skill_scan_impl_success(tmp_path):
     )
     data = json.loads(result)
     assert data["summary"]["files_scanned"] == 1
+    trust = data["files"][0]["trust"]
+    assert trust["verdict"] == "benign"
+    assert trust["content_verdict"] == "benign"
+    assert trust["provenance_verdict"] == "unverified"
+    assert trust["overall_recommendation"] == "review"
 
 
 def test_skill_verify_impl_success(tmp_path):
@@ -1251,6 +1256,10 @@ def test_skill_trust_impl_success(tmp_path):
     data = json.loads(result)
     assert "verdict" in data
     assert "categories" in data
+    assert data["verdict"] == "benign"
+    assert data["content_verdict"] == "benign"
+    assert data["provenance_verdict"] == "unverified"
+    assert data["overall_recommendation"] == "review"
     assert data["provenance"]["status"] == "unsigned"
 
 
